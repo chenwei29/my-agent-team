@@ -1,0 +1,88 @@
+"""`/api/conversations` —— 会话的列表 / 创建 / 变更 / 删除。
+
+PATCH /{id} 是本阶段最容易写错的点：前端用同一个端点做 5 件事，按 body 字段区分。
+"""
+
+from __future__ import annotations
+
+from fastapi import APIRouter, Depends, Request
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.api.helpers import read_json
+from app.db.session import get_session
+from app.errors import HttpError, ServiceError
+from app.schemas.base import validate_body
+from app.schemas.entities import (
+    ConversationResponse,
+    ConversationsResponse,
+    CreateConversationBody,
+    PatchConversationBody,
+)
+from app.services import conversation_service
+
+router = APIRouter(prefix="/api/conversations", tags=["conversations"])
+
+
+@router.get("", response_model=ConversationsResponse)
+async def list_conversations(session: AsyncSession = Depends(get_session)) -> dict:
+    return {"conversations": await conversation_service.list_conversations(session)}
+
+
+@router.post("", status_code=201, response_model=ConversationResponse)
+async def create_conversation(request: Request, session: AsyncSession = Depends(get_session)) -> dict:
+    body = validate_body(CreateConversationBody, await read_json(request))
+    try:
+        conversation = await conversation_service.create_conversation(
+            session, body.model_dump()
+        )
+    except ServiceError as err:
+        raise HttpError(400, err.message) from err
+    return {"conversation": conversation}
+
+
+@router.patch("/{conversation_id}", response_model=ConversationResponse)
+async def patch_conversation(
+    conversation_id: str, request: Request, session: AsyncSession = Depends(get_session)
+) -> dict:
+    body = validate_body(PatchConversationBody, await read_json(request))
+
+    # 按固定顺序依次应用，后应用的覆盖前者的返回值 —— 多字段同时出现时就是这个顺序
+    conversation = None
+    try:
+        if body.title is not None:
+            conversation = await conversation_service.rename_conversation(
+                session, conversation_id, body.title
+            )
+        if body.add_agent_ids is not None:
+            conversation = await conversation_service.add_agents_to_conversation(
+                session, conversation_id, body.add_agent_ids
+            )
+        if body.fs_write_approval_mode is not None:
+            conversation = await conversation_service.set_conversation_approval_mode(
+                session, conversation_id, body.fs_write_approval_mode
+            )
+        if body.toggle_pin:
+            conversation = await conversation_service.toggle_pin_conversation(
+                session, conversation_id
+            )
+        if body.toggle_archive:
+            conversation = await conversation_service.toggle_archive_conversation(
+                session, conversation_id
+            )
+    except ServiceError as err:
+        raise HttpError(400, err.message) from err
+
+    assert conversation is not None  # validate_body 已保证至少一个字段存在
+    return {"conversation": conversation}
+
+
+@router.delete("/{conversation_id}")
+async def delete_conversation(
+    conversation_id: str, session: AsyncSession = Depends(get_session)
+) -> dict:
+    try:
+        await conversation_service.delete_conversation(session, conversation_id)
+    except ServiceError as err:
+        # DELETE 出错一律返回 404（连 not found 也是）
+        raise HttpError(404, err.message) from err
+    return {"ok": True}
