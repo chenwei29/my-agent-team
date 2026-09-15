@@ -203,7 +203,7 @@ async def _execute_run(
                 )
             )
 
-            adapter = get_adapter(agent.adapter_name)
+            adapter = get_adapter("mock")
             adapter_input = AdapterInput(
                 agentId=agent_id,
                 conversationId=conversation_id,
