@@ -284,11 +284,11 @@ async def test_group_mention_outside_conversation_starts_nothing(client: AsyncCl
     await wait_for_runs(res.json()["runIds"])
 
 
-# ─── 没有 adapter 的 agent 要明确失败 ────────────────────────
+# ─── 配置缺失的 agent 要明确失败 ────────────────────────
 
 
-async def test_run_without_adapter_fails_loudly(client: AsyncClient):
-    """P2 只有 mock：custom agent 必须明确报失败，不能假装成功或退化成 mock。"""
+async def test_custom_agent_without_key_fails_loudly(client: AsyncClient):
+    """custom agent（deepseek）没有任何可用 key：run 必须明确失败，不能假装成功。"""
     conversation = await _create_conversation(client, ["ag_pm"], mode="single")
     cid = conversation["id"]
 
@@ -298,13 +298,13 @@ async def test_run_without_adapter_fails_loudly(client: AsyncClient):
 
     row = await run_row(run_id)
     assert row.status == "failed"
-    assert "Adapter not implemented yet" in row.error
+    assert "DEEPSEEK_API_KEY not set" in row.error
 
     messages = await messages_of(cid)
     error_message = [m for m in messages if m.id.startswith("msg_err_")][0]
     assert error_message.status == "error"
     assert error_message.parts[0]["content"].startswith("[失败]")
-    assert "Adapter not implemented yet" in error_message.parts[0]["content"]
+    assert "DEEPSEEK_API_KEY not set" in error_message.parts[0]["content"]
 
 
 # ─── decide_responders 纯函数 ───────────────────────────────

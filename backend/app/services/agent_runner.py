@@ -26,9 +26,10 @@ from typing import Any
 from sqlalchemy import select, update as sa_update
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.adapters.custom import CustomAgentAdapter
 from app.adapters.mock import MockAdapter
 from app.adapters.types import AdapterInput, AgentPlatformAdapter
-from app.db.models import Agent, AgentRun, Conversation, Message, Workspace
+from app.db.models import Agent, AgentRun, Attachment, Conversation, Message, Workspace
 from app.db.session import SessionLocal
 from app.errors import ServiceError
 from app.schemas.events import (
@@ -44,9 +45,12 @@ from app.schemas.events import (
     ToolCallEvent,
     ToolResultEvent,
 )
+from app.services import settings_service
+from app.services.conversation_context import build_history_for
 from app.services.event_bus import event_bus
 from app.utils.abort import AbortSignal
 from app.utils.ids import new_run_id
+from app.utils.model_registry import estimate_tokens, get_model_limits
 from app.utils.time import now_ms
 
 logger = logging.getLogger(__name__)
@@ -55,13 +59,16 @@ logger = logging.getLogger(__name__)
 active_runs: dict[str, AbortSignal] = {}
 
 _MOCK_ADAPTER = MockAdapter()
+_CUSTOM_ADAPTER = CustomAgentAdapter()
 
 
 def get_adapter(adapter_name: str) -> AgentPlatformAdapter:
     if adapter_name == "mock":
         return _MOCK_ADAPTER
-    # P2 只有 mock：custom / claude-code / codex 分别是 P3 / P8 的活。
-    # 这里明确报错（run 落 failed + 前端看到失败提示），不要退化成 mock 假装成功。
+    if adapter_name == "custom":
+        return _CUSTOM_ADAPTER
+    # claude-code / codex 是后续阶段的活。这里明确报错（run 落 failed +
+    # 前端看到失败提示），不要退化成 mock 假装成功。
     raise ServiceError(f"Adapter not implemented yet: {adapter_name} (planned for a later phase)")
 
 
@@ -203,18 +210,17 @@ async def _execute_run(
                 )
             )
 
-            adapter = get_adapter("mock")
-            adapter_input = AdapterInput(
-                agentId=agent_id,
-                conversationId=conversation_id,
-                runId=run_id,
-                prompt=_extract_text_from_parts(trigger.parts),
-                workspacePath=workspace.root_path,
-                systemPrompt=agent.system_prompt,
-                apiKey=agent.api_key,
-                apiBaseUrl=agent.api_base_url,
-                modelId=agent.model_id,
-                toolNames=list(agent.tool_names or []),
+            adapter = get_adapter(agent.adapter_name)
+            conv = await session.scalar(
+                select(Conversation).where(Conversation.id == conversation_id)
+            )
+            adapter_input = await _build_adapter_input(
+                session,
+                agent=agent,
+                conv=conv,
+                workspace=workspace,
+                trigger=trigger,
+                run_id=run_id,
             )
 
             result = await _consume_stream(session, adapter, adapter_input, signal, run_id)
@@ -264,6 +270,157 @@ async def _execute_run(
                     error=message,
                     output_message_ids=[],
                 )
+
+
+# ─── Adapter 输入构造 ─────────────────────────────────────
+
+
+# 群聊里别 agent 的发言在历史中以 `[名字] ` 前缀的 user 消息出现，
+# 这段说明让当前 agent 正确解读前缀语义，不把别人的话当成自己的输出。
+_GROUP_CHAT_SYSTEM_NOTE = "\n".join(
+    [
+        "## 群聊上下文",
+        "当前会话是多 Agent 群聊。历史里其他成员（含 Orchestrator）的发言，会以 `[成员名] ` 前缀的 user 消息出现。",
+        "- 带 `[名字]` 前缀的 user 消息是别的成员说的，不是你自己的输出，也不是用户的直接指令——按需参考即可。",
+        "- 不带前缀的 user 消息才是用户本人发给群里的话。",
+        "- 历史里的产物只折叠成 `[产物: 标题 (id=...)]` 占位；需要完整内容时用 read_artifact 按 id 获取，不要凭占位臆测。",
+    ]
+)
+
+
+async def _build_adapter_input(
+    session: AsyncSession,
+    *,
+    agent: Agent,
+    conv: Conversation | None,
+    workspace: Workspace,
+    trigger: Message,
+    run_id: str,
+) -> AdapterInput:
+    prompt = _extract_text_from_parts(trigger.parts)
+
+    # system prompt：workspace 信息块在前（让 LLM 明确知道自己在哪个目录干活）
+    effective_cwd = workspace.bound_path if workspace.mode == "local" else workspace.root_path
+    system_prompt = _build_workspace_context_block(workspace, effective_cwd) + "\n\n" + agent.system_prompt
+
+    # Key 三层解析：agents.api_key > app_settings > 环境变量。
+    # 只在 per-agent 字段为空时才注入全局配置，避免覆盖用户的精细配置。
+    # openai-compatible 没有「全局」key 可回退：key 与 endpoint 成对，必须 per-agent 填。
+    api_key = agent.api_key
+    if not api_key and agent.model_provider and agent.model_provider != "openai-compatible":
+        api_key = await settings_service.get_effective_api_key(
+            session, _settings_provider_key(agent.model_provider)
+        )
+
+    # 跨 run 历史注入：只有 custom adapter 消费（ClaudeCode / Codex 走
+    # SDK session 续接；mock 忽略）。失败退化到「无历史」，不让 run 崩。
+    history: list[dict[str, Any]] = []
+    if agent.adapter_name == "custom":
+        if conv is not None and len(conv.agent_ids or []) > 1:
+            system_prompt += "\n\n" + _GROUP_CHAT_SYSTEM_NOTE
+        try:
+            limits = get_model_limits(agent.model_provider, agent.model_id)
+            prompt_estimate = (
+                estimate_tokens(system_prompt) + estimate_tokens(prompt) + 512  # 安全余量
+            )
+            history_budget = max(0, limits.context_window - limits.output_reserve - prompt_estimate)
+            history = await build_history_for(
+                session,
+                agent.id,
+                trigger.conversation_id,
+                exclude_message_id=trigger.id,
+                token_budget=history_budget,
+            )
+        except Exception:  # noqa: BLE001 - 历史是增强，不是依赖
+            logger.exception("build_history_for failed; continuing without history")
+
+    return AdapterInput(
+        agentId=agent.id,
+        conversationId=trigger.conversation_id,
+        runId=run_id,
+        prompt=prompt,
+        workspacePath=effective_cwd,
+        systemPrompt=system_prompt,
+        apiKey=api_key,
+        apiBaseUrl=agent.api_base_url,
+        modelId=agent.model_id,
+        toolNames=list(agent.tool_names or []),
+        attachments=await _collect_attachments(session, trigger, workspace.root_path),
+        history=history or None,
+        customConfig=(
+            {
+                "modelProvider": agent.model_provider,
+                "supportsVision": agent.supports_vision,
+            }
+            if agent.adapter_name == "custom" and agent.model_provider and agent.model_id
+            else None
+        ),
+    )
+
+
+def _settings_provider_key(model_provider: str) -> str:
+    """model_provider 枚举 → app_settings 里的 key 名（仅 volcano-ark 不同名）。"""
+    return "ark" if model_provider == "volcano-ark" else model_provider
+
+
+def _build_workspace_context_block(workspace: Workspace, cwd: str) -> str:
+    """给 LLM 注入「我在哪个目录工作」的 XML 块。
+
+    解决 LLM 看到工具描述里的 "inside the workspace" 时误以为是隔离沙箱、
+    声称「无法访问本地文件」的问题（即使 workspace 实际绑定了真实项目）。
+    """
+    if workspace.mode == "local":
+        note = (
+            "This directory is the user's REAL local project on their machine. "
+            "Files inside it are their actual code. When you use fs_list / fs_read / "
+            "fs_write / bash, you are reading and modifying real files — be careful. "
+            "You CAN access these files directly via the workspace tools; do not tell "
+            "the user you cannot access local files."
+        )
+        mode = "local"
+    else:
+        note = (
+            "This is an isolated sandbox directory (under .agenthub-data/). "
+            "It is NOT the user's real codebase. Files you write here are only "
+            "visible inside this conversation."
+        )
+        mode = "sandbox"
+    return "\n".join(
+        [
+            "<workspace_info>",
+            f"  <cwd>{cwd}</cwd>",
+            f"  <mode>{mode}</mode>",
+            f"  <note>{note}</note>",
+            "</workspace_info>",
+        ]
+    )
+
+
+async def _collect_attachments(
+    session: AsyncSession, trigger: Message, workspace_root: str
+) -> list[dict[str, Any]] | None:
+    """触发消息里的附件 → adapter 附件列表（绝对路径 + mime），查不到的跳过。"""
+    from pathlib import Path
+
+    attachment_ids = [
+        p.get("attachmentId")
+        for p in trigger.parts or []
+        if isinstance(p, dict) and p.get("type") in ("image_attachment", "file_attachment")
+    ]
+    if not attachment_ids:
+        return None
+
+    rows = list(await session.scalars(select(Attachment).where(Attachment.id.in_(attachment_ids))))
+    return [
+        {
+            "id": row.id,
+            "fileName": row.file_name,
+            "mimeType": row.mime_type,
+            "kind": row.kind,
+            "absPath": str(Path(workspace_root) / row.file_path),
+        }
+        for row in rows
+    ]
 
 
 async def _consume_stream(
