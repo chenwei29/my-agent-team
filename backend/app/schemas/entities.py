@@ -264,3 +264,75 @@ class UpdateSettingsBody(CamelModel):
     deployment_publish_enabled: bool | None = None
     deployment_publish_dir: str | None = None
     deployment_public_base_url: str | None = None
+
+
+# ─── 会话内文件（FileTab 手动浏览，与工具沙箱共用 fs_service） ──
+class WorkspaceFsEntry(CamelModel):
+    name: str
+    is_directory: bool
+    size: int | None = None
+
+
+class WorkspaceListResult(CamelModel):
+    rel_path: str
+    absolute_path: str
+    parent: str | None
+    entries: list[WorkspaceFsEntry]
+
+
+class WorkspaceReadResult(CamelModel):
+    path: str
+    absolute_path: str
+    cwd: str
+    size: int
+    content: str
+    truncated: bool
+
+
+class WorkspaceWriteResult(CamelModel):
+    path: str
+    absolute_path: str
+    cwd: str
+    bytes: int
+
+
+class WorkspaceFsWriteBody(CamelModel):
+    path: Annotated[str, Field(min_length=1)]
+    content: str
+
+
+# ─── 审批请求体 ─────────────────────────────────────────────
+class ResolvePendingBody(CamelModel):
+    action: Literal["approve", "reject"]
+
+
+class AskUserAnswerBody(CamelModel):
+    selected_labels: list[str]
+    freeform_note: str | None = None
+
+
+class AnswerQuestionsBody(CamelModel):
+    answers: dict[str, AskUserAnswerBody]
+
+
+# ─── 附件 ──────────────────────────────────────────────────
+class AttachmentOut(CamelModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    conversation_id: str
+    kind: str
+    file_name: str
+    file_path: str
+    size: int
+    mime_type: str
+    created_at: int
+
+
+class AttachmentResponse(CamelModel):
+    attachment: AttachmentOut
+
+
+class AttachmentsResponse(CamelModel):
+    attachments: list[AttachmentOut]
+

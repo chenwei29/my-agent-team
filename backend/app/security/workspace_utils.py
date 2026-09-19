@@ -1,7 +1,12 @@
 """workspace 路径安检 —— 判断目标路径是否允许被读写 / 列目录。
 
-P1 只用得到 is_path_safe（建会话校验 boundPath、listdir API 校验导航目标）。
-get_effective_cwd / resolve_safe_path 是 P4 沙箱的活，这里先不引。
+两组职责：
+- ``is_path_safe``：会话绑定目录 / 导航目标的「软安全」黑名单（敏感目录、系统根、UNC），
+  输入先 realpath 再比较（macOS 上 /tmp → /private/tmp 必须跟着走）。
+- ``get_effective_cwd`` / ``resolve_safe_path`` / ``assert_path_within_workspace``：
+  工具沙箱边界。这里刻意用 **词法** 归一化（os.path.abspath，不解析符号链接）——
+  只关心 LLM 传来的路径串经过 ``..`` / 绝对化之后是否落在 cwd 子树内；
+  符号链接本身的防护在 scan_workspace_usage 的 visited 集合里。
 """
 
 from __future__ import annotations
@@ -81,17 +86,50 @@ def _sensitive_segments() -> list[str]:
     ]
 
 
+class PathOutsideWorkspaceError(Exception):
+    """目标路径解析后落在 workspace 子树之外（路径逃逸）。"""
+
+
 def is_path_within(child: str, parent: str) -> bool:
-    """子路径包含判断。Windows 大小写不敏感；POSIX 大小写敏感。"""
+    """子路径包含判断（词法归一化，不解析符号链接）。
+
+    Windows 大小写不敏感；POSIX 大小写敏感。等值也算「在内」；
+    ``p + os.sep`` 的分隔符守卫挡住 ``workspace-evil`` 这类前缀陷阱。
+    """
 
     def norm(p: str) -> str:
-        # path.resolve 语义：绝对化 + 解析符号链接 + 规范化
-        resolved = os.path.realpath(p)
+        # abspath = 绝对化 + 词法规范化（.. 折叠），不追符号链接 —— 沙箱边界的
+        # 语义就是「字符串上算不出去」；调用方若已 realpath 过输入，同样成立。
+        resolved = os.path.abspath(p)
         return resolved.lower() if IS_WINDOWS else resolved
 
     c = norm(child)
     p = norm(parent)
     return c == p or c.startswith(p + os.sep)
+
+
+def get_effective_cwd(workspace) -> str:
+    """工具实际工作的目录：local 且绑定了 bound_path 用之，否则 sandbox 根。"""
+    if workspace.mode == "local" and workspace.bound_path:
+        return workspace.bound_path
+    return workspace.root_path
+
+
+def resolve_safe_path(workspace, target: str) -> str | None:
+    """把（相对或绝对）目标解析到绝对路径；逃逸出 cwd 子树返回 None。"""
+    cwd = get_effective_cwd(workspace)
+    absolute = os.path.abspath(target) if os.path.isabs(target) else os.path.abspath(os.path.join(cwd, target))
+    if not is_path_within(absolute, cwd):
+        return None
+    return absolute
+
+
+def assert_path_within_workspace(workspace, target: str) -> str:
+    """resolve_safe_path 的抛错版 —— 工具边界用它，逃逸直接炸。"""
+    resolved = resolve_safe_path(workspace, target)
+    if resolved is None:
+        raise PathOutsideWorkspaceError(f'Path "{target}" is outside workspace')
+    return resolved
 
 
 def is_path_safe(abs_path: str) -> bool:

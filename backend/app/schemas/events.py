@@ -195,7 +195,7 @@ class ArtifactRecord(BaseModel):
 
 
 class PendingWrite(BaseModel):
-    """等待用户确认的文件写入（fs_write.pending 的 payload）；P4 落地时再收紧字段类型。"""
+    """等待用户确认的文件写入（fs_write.pending 的 payload）。"""
 
     model_config = ConfigDict(extra="forbid")
     id: str
@@ -210,7 +210,7 @@ class PendingWrite(BaseModel):
 
 
 class PendingBashCommand(BaseModel):
-    """等待用户确认的 bash 命令（bash_command.pending 的 payload）；P4 落地时再收紧字段类型。"""
+    """等待用户确认的 bash 命令（bash_command.pending 的 payload）。"""
 
     model_config = ConfigDict(extra="forbid")
     id: str
@@ -223,15 +223,34 @@ class PendingBashCommand(BaseModel):
     createdAt: int
 
 
+class AskUserOption(BaseModel):
+    """ask_user 单个选项。"""
+
+    model_config = ConfigDict(extra="forbid")
+    label: str
+    description: str = ""
+    preview: str | None = None
+
+
+class AskUserQuestionItem(BaseModel):
+    """ask_user 单个问题：1–4 问 × 每问 2–4 选项，multiSelect 可多选。"""
+
+    model_config = ConfigDict(extra="forbid")
+    question: str
+    header: str
+    multiSelect: bool = False
+    options: list[AskUserOption]
+
+
 class PendingQuestion(BaseModel):
-    """等待用户回答的一组问题（ask_user.pending 的 payload）；questions 的元素结构 P4 再定。"""
+    """等待用户回答的一组问题（ask_user.pending 的 payload）。"""
 
     model_config = ConfigDict(extra="forbid")
     id: str
     conversationId: str
     agentId: str
     runId: str
-    questions: list[dict[str, Any]]
+    questions: list[AskUserQuestionItem]
     createdAt: int
 
 

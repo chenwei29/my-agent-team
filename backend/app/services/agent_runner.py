@@ -45,9 +45,13 @@ from app.schemas.events import (
     ToolCallEvent,
     ToolResultEvent,
 )
+from app.security.workspace_utils import get_effective_cwd
 from app.services import settings_service
 from app.services.conversation_context import build_history_for
 from app.services.event_bus import event_bus
+from app.services.pending_bash_commands import pending_bash_commands
+from app.services.pending_questions import pending_questions
+from app.services.pending_writes import pending_writes
 from app.utils.abort import AbortSignal
 from app.utils.ids import new_run_id
 from app.utils.model_registry import estimate_tokens, get_model_limits
@@ -300,7 +304,7 @@ async def _build_adapter_input(
     prompt = _extract_text_from_parts(trigger.parts)
 
     # system prompt：workspace 信息块在前（让 LLM 明确知道自己在哪个目录干活）
-    effective_cwd = workspace.bound_path if workspace.mode == "local" else workspace.root_path
+    effective_cwd = get_effective_cwd(workspace)
     system_prompt = _build_workspace_context_block(workspace, effective_cwd) + "\n\n" + agent.system_prompt
 
     # Key 三层解析：agents.api_key > app_settings > 环境变量。
@@ -575,6 +579,13 @@ async def _finalize(
     output_message_ids: list[str],
 ) -> None:
     finished_at = now_ms()
+
+    if status in ("failed", "aborted"):
+        # run 终止：清掉它名下所有挂起的审批项（工具侧的 abort listener 负责
+        # 在飞的 await，这里兜底 register→attach 之间竞态漏掉的）
+        pending_writes.cancel_for_run(run_id)
+        pending_questions.cancel_for_run(run_id)
+        pending_bash_commands.cancel_for_run(run_id)
 
     if status in ("failed", "aborted"):
         await _persist_unresolved_tool_failures(

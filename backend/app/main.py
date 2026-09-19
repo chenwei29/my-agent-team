@@ -14,10 +14,25 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-from app.api import agents, conversations, fs, messages, platform, runs, settings, stream
+from app.api import (
+    agents,
+    attachments,
+    conversation_fs,
+    conversations,
+    fs,
+    messages,
+    pending_bash_commands,
+    pending_questions,
+    pending_writes,
+    platform,
+    runs,
+    settings,
+    stream,
+)
 from app.config import get_settings
 from app.db.bootstrap import bootstrap_database
 from app.errors import HttpError, InvalidBody, ServiceError
+from app.tools.builtin import register_builtin_tools
 
 _DEFAULT_ORIGINS = [
     "http://localhost:3000",
@@ -42,6 +57,8 @@ async def lifespan(_app: FastAPI):
 
 app = FastAPI(title="AgentHub (Python)", lifespan=lifespan)
 
+register_builtin_tools()
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_allowed_origins(),
@@ -53,8 +70,14 @@ app.add_middleware(
 )
 
 app.include_router(agents.router)
+app.include_router(attachments.conv_router)
+app.include_router(attachments.item_router)
 app.include_router(conversations.router)
+app.include_router(conversation_fs.router)
 app.include_router(messages.router)
+app.include_router(pending_bash_commands.router)
+app.include_router(pending_questions.router)
+app.include_router(pending_writes.router)
 app.include_router(platform.router)
 app.include_router(fs.router)
 app.include_router(settings.router)
