@@ -66,7 +66,8 @@ async def test_write_artifact_creates_row(conversation_with_agent: dict):
     rows = await _artifacts_of(conv["id"])
     assert len(rows) == 1
     assert rows[0].created_by_agent_id == MOCK_ID
-    assert rows[0].content == {"format": "markdown", "content": "# 标题"}
+    # 内容经规整后带上 type 判别键
+    assert rows[0].content == {"type": "document", "format": "markdown", "content": "# 标题"}
 
 
 async def test_write_artifact_version_chain(conversation_with_agent: dict):
@@ -123,13 +124,22 @@ async def test_write_artifact_parent_not_found(conversation_with_agent: dict):
     assert "not found: art_nope" in result.error
 
 
-async def test_write_artifact_content_must_be_object(conversation_with_agent: dict):
+async def test_write_artifact_invalid_content(conversation_with_agent: dict):
     result = await WRITE_ARTIFACT_TOOL.handler(
-        {"type": "document", "title": "t", "content": "not-an-object"},
+        {"type": "document", "title": "t", "content": 123},
         _ctx(conversation_with_agent["id"], MOCK_ID),
     )
     assert not result.ok
-    assert "must be a JSON object" in result.error
+    assert result.error == "Invalid content for type document"
+
+    # 字符串化的 content 包装会被规整层解包救回
+    import json as _json
+
+    result = await WRITE_ARTIFACT_TOOL.handler(
+        {"type": "document", "title": "t", "content": _json.dumps({"content": "# hi"})},
+        _ctx(conversation_with_agent["id"], MOCK_ID),
+    )
+    assert result.ok
 
 
 async def test_write_artifact_invalid_type(conversation_with_agent: dict):
@@ -154,7 +164,7 @@ async def test_read_artifact_scoped_to_conversation(conversation_with_agent: dic
     )
     assert result.ok
     assert result.value["id"] == artifact_id
-    assert result.value["content"] == {"format": "markdown", "content": "hi"}
+    assert result.value["content"] == {"type": "document", "format": "markdown", "content": "hi"}
 
     # 其他会话读不到
     result = await READ_ARTIFACT_TOOL.handler(

@@ -33,6 +33,8 @@ from app.db.models import Agent, AgentRun, Attachment, Conversation, Message, Wo
 from app.db.session import SessionLocal
 from app.errors import ServiceError
 from app.schemas.events import (
+    ArtifactCreateEvent,
+    DeployStatusEvent,
     MessageEndEvent,
     MessageStartEvent,
     PartDeltaEvent,
@@ -434,7 +436,11 @@ async def _consume_stream(
     signal: AbortSignal,
     run_id: str,
 ) -> dict[str, Any]:
-    """消费 adapter 事件：**每条先落库、再广播**。"""
+    """消费 adapter 事件：**每条先落库、再广播**。
+
+    落库可能派生新事件（artifact.create → 注入 artifact_ref part），派生事件同样按
+    「先落库、再广播」的顺序补发。
+    """
     parts_buffer: dict[str, list[Any]] = {}
     output_message_ids: list[str] = []
     current_message_id: str | None = None
@@ -442,15 +448,18 @@ async def _consume_stream(
     async for event in adapter.stream(adapter_input, signal):
         if isinstance(event, MessageStartEvent):
             current_message_id = event.messageId
-        await _persist_event(
+        derived = await _persist_event(
             session,
             event,
             parts_buffer=parts_buffer,
             output_message_ids=output_message_ids,
             run_id=run_id,
             agent_id=adapter_input.agentId,
+            current_message_id=current_message_id,
         )
         event_bus.publish(event)
+        for extra in derived:
+            event_bus.publish(extra)
 
     return {"output_message_ids": output_message_ids, "current_message_id": current_message_id}
 
@@ -463,7 +472,10 @@ async def _persist_event(
     output_message_ids: list[str],
     run_id: str,
     agent_id: str,
-) -> None:
+    current_message_id: str | None = None,
+) -> list[StreamEvent]:
+    """落库一条事件；返回需要补发的派生事件（通常是 part.start）。"""
+    derived: list[StreamEvent] = []
     if isinstance(event, RunUsageEventWrapper):
         await session.execute(
             sa_update(AgentRun)
@@ -539,6 +551,31 @@ async def _persist_event(
         )
         await _write_parts(session, event.messageId, parts)
 
+    elif isinstance(event, ArtifactCreateEvent):
+        # 工具产出的产物除了 tool_result，还要在消息里挂一个 artifact_ref part，
+        # 否则聊天流里只有一行工具日志、看不到产物卡片
+        if current_message_id is not None:
+            extra = await _append_part(
+                session,
+                parts_buffer,
+                current_message_id,
+                {"type": "artifact_ref", "artifactId": event.artifact.id},
+                event,
+            )
+            if extra is not None:
+                derived.append(extra)
+
+    elif isinstance(event, DeployStatusEvent):
+        extra = await _append_part(
+            session,
+            parts_buffer,
+            event.messageId,
+            {"type": "deploy_status", "deployment": event.deployment},
+            event,
+        )
+        if extra is not None:
+            derived.append(extra)
+
     elif isinstance(event, MessageEndEvent):
         await session.execute(
             sa_update(Message).where(Message.id == event.messageId).values(status="complete")
@@ -546,7 +583,32 @@ async def _persist_event(
         await session.commit()
         parts_buffer.pop(event.messageId, None)
 
-    # 其它事件（part.end / message.added / artifact.* / deploy.* / dispatch.*）在 P2 落库侧是 no-op
+    # 其它事件（part.end / message.added / artifact.update / dispatch.*）在落库侧是 no-op
+    return derived
+
+
+async def _append_part(
+    session: AsyncSession,
+    parts_buffer: dict[str, list[Any]],
+    message_id: str,
+    part: dict[str, Any],
+    source: StreamEvent,
+) -> PartStartEvent | None:
+    """往消息末尾追加一个 part 并落库；消息已收尾（不在 buffer 里）时什么都不做。"""
+    parts = parts_buffer.get(message_id)
+    if parts is None:
+        return None
+
+    part_index = len(parts)
+    parts.append(part)
+    await _write_parts(session, message_id, parts)
+    return PartStartEvent(
+        conversationId=source.conversationId,
+        timestamp=now_ms(),
+        messageId=message_id,
+        partIndex=part_index,
+        part=part,
+    )
 
 
 def _delta_matches_part(delta_type: str, part_type: Any) -> bool:

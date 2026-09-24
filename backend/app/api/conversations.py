@@ -16,9 +16,10 @@ from app.schemas.entities import (
     ConversationResponse,
     ConversationsResponse,
     CreateConversationBody,
+    DeployConversationBody,
     PatchConversationBody,
 )
-from app.services import conversation_service
+from app.services import conversation_service, deploy_command_service
 
 router = APIRouter(prefix="/api/conversations", tags=["conversations"])
 
@@ -74,6 +75,44 @@ async def patch_conversation(
 
     assert conversation is not None  # validate_body 已保证至少一个字段存在
     return {"conversation": conversation}
+
+
+@router.get("/{conversation_id}/deploy")
+async def list_deploy_candidates(
+    conversation_id: str, session: AsyncSession = Depends(get_session)
+) -> dict:
+    """可部署的 web_app 产物候选（按创建时间倒序）。"""
+    return {
+        "candidates": await deploy_command_service.list_deploy_candidates(
+            session, conversation_id
+        )
+    }
+
+
+@router.post("/{conversation_id}/deploy")
+async def deploy_conversation(
+    conversation_id: str, request: Request, session: AsyncSession = Depends(get_session)
+) -> dict:
+    """带 artifactId 部署指定产物；不带则走「唯一候选自动部署 / 多候选返回列表」的判定。"""
+    raw = await read_json(request)
+    parsed = validate_body(DeployConversationBody, raw if isinstance(raw, dict) else {})
+    try:
+        return await deploy_command_service.handle_deploy_command(
+            session, conversation_id, parsed.artifact_id
+        )
+    except ServiceError as err:
+        raise HttpError(400, err.message) from err
+
+
+@router.post("/{conversation_id}/regenerate")
+async def regenerate_conversation(
+    conversation_id: str, session: AsyncSession = Depends(get_session)
+) -> dict:
+    """删掉最后一条 user 之后的回复，用同一条 user 消息重新触发 agent（错误一律 400）。"""
+    try:
+        return await conversation_service.regenerate_latest_response(session, conversation_id)
+    except ServiceError as err:
+        raise HttpError(400, err.message) from err
 
 
 @router.delete("/{conversation_id}")

@@ -19,6 +19,7 @@ from app.config import get_settings
 from app.db.models import (
     Agent,
     AgentRun,
+    Artifact,
     Attachment,
     ContextSummary,
     Conversation,
@@ -26,14 +27,24 @@ from app.db.models import (
     Workspace,
 )
 from app.errors import ConflictError, NotFoundError, ServiceError
-from app.schemas.events import MessageAddedEvent, MessageRecord, MessageUsageEvent
+from app.schemas.entities import MessageOut
+from app.schemas.events import (
+    MessageAddedEvent,
+    MessageRecord,
+    MessageRemovedEvent,
+    MessageUsageEvent,
+)
 from app.security.workspace_utils import is_path_safe
-from app.services.agent_runner import start_run
+from app.services import deploy_command_service
+from app.services.agent_runner import abort_run, start_run
 from app.services.event_bus import event_bus
 from app.utils.ids import new_conversation_id, new_message_id, new_workspace_id
 from app.utils.time import now_ms
 
 _IS_WINDOWS = os.name == "nt"
+
+# pin 上限（与 web/src/shared/constants.ts 的 PIN_LIMIT_PER_CONVERSATION 一致）
+PIN_LIMIT_PER_CONVERSATION = 5
 
 
 def _attach_workspace_meta(conv: Conversation, ws: Workspace | None) -> Conversation:
@@ -408,6 +419,26 @@ async def send_message(session: AsyncSession, args: dict[str, Any]) -> dict[str,
         )
     )
 
+    # 「部署」指令：只认纯文本单 part、无 @、无附件、无 parent 的消息，避免误判正常提问
+    deploy_intent = (
+        deploy_command_service.parse_deploy_command(content)
+        if len(parts) == 1
+        and not parent_message_id
+        and not mentioned_agent_ids
+        and not attachment_ids
+        else None
+    )
+    if deploy_intent is not None:
+        deploy = await deploy_command_service.handle_deploy_command(
+            session, conversation_id, deploy_intent.get("artifact_id"), after_created_at=now
+        )
+        return {
+            "messageId": message_id,
+            "runIds": [],
+            "messages": [deploy["message"]],
+            "deploy": deploy,
+        }
+
     agents_in_conv = await _agents_in_conversation(session, list(conv.agent_ids))
     responder_ids = decide_responders(conv, list(mentioned_agent_ids), agents_in_conv)
 
@@ -467,3 +498,266 @@ def decide_responders(conv: Conversation, mentions: list[str], agents_in_conv: l
         return [m for m in mentions if m in conv.agent_ids]
     orchestrator = next((a for a in agents_in_conv if a.is_orchestrator), None)
     return [orchestrator.id] if orchestrator is not None else []
+
+
+# ─── 书签 / Pin 消息 ─────────────────────────────────────
+async def _conversation_or_404(session: AsyncSession, conversation_id: str) -> Conversation:
+    conv = await session.scalar(select(Conversation).where(Conversation.id == conversation_id))
+    if conv is None:
+        raise NotFoundError(f"Conversation not found: {conversation_id}")
+    return conv
+
+
+async def _message_in_conversation(
+    session: AsyncSession, conversation_id: str, message_id: str
+) -> Message:
+    row = await session.scalar(
+        select(Message).where(
+            Message.id == message_id, Message.conversation_id == conversation_id
+        )
+    )
+    if row is None:
+        raise NotFoundError(f"Message not found in conversation: {message_id}")
+    return row
+
+
+def _toggle_in_list(current: list[str], message_id: str) -> tuple[list[str], bool]:
+    """返回 (新列表, 本次是「加入」还是「移除」)。"""
+    if message_id in current:
+        return [i for i in current if i != message_id], False
+    return [*current, message_id], True
+
+
+async def toggle_bookmarked_message(
+    session: AsyncSession, conversation_id: str, message_id: str
+) -> dict[str, Any]:
+    """UI 书签：只用于导航定位/高亮，不进 LLM 上下文（pin 才进）。无条数上限。"""
+    conv = await _conversation_or_404(session, conversation_id)
+    await _message_in_conversation(session, conversation_id, message_id)
+
+    next_ids, bookmarked = _toggle_in_list(list(conv.bookmarked_message_ids or []), message_id)
+    conv.bookmarked_message_ids = next_ids
+    conv.updated_at = now_ms()
+    await session.commit()
+    return {"bookmarkedMessageIds": next_ids, "bookmarked": bookmarked}
+
+
+async def toggle_pinned_message(
+    session: AsyncSession, conversation_id: str, message_id: str
+) -> dict[str, Any]:
+    """Pin = 注入 LLM 长期上下文（agent 每次拼上下文都带上）。
+
+    与书签的差异：有 PIN_LIMIT_PER_CONVERSATION 上限；不更新 updatedAt
+    （pin 不算「会话活跃」，不应把会话顶到侧栏最前）。
+    """
+    conv = await _conversation_or_404(session, conversation_id)
+    await _message_in_conversation(session, conversation_id, message_id)
+
+    current = list(conv.pinned_message_ids or [])
+    if message_id not in current and len(current) >= PIN_LIMIT_PER_CONVERSATION:
+        raise ServiceError("PIN_LIMIT_EXCEEDED")
+    next_ids, pinned = _toggle_in_list(current, message_id)
+
+    conv.pinned_message_ids = next_ids
+    await session.commit()
+    return {"pinnedMessageIds": next_ids, "pinned": pinned}
+
+
+# ─── 撤回 / 重新生成 / 编辑重发 ───────────────────────────
+def _artifact_ids_in(messages: list[Message]) -> list[str]:
+    """从 parts 里收集 artifact_ref 指向的产物 id（撤回时要级联删掉）。"""
+    ids: list[str] = []
+    for message in messages:
+        for part in message.parts or []:
+            if part.get("type") == "artifact_ref" and part.get("artifactId"):
+                ids.append(part["artifactId"])
+    return sorted(set(ids))
+
+
+async def _abort_runs_since(
+    session: AsyncSession, conversation_id: str, since_ms: int, *, inclusive: bool
+) -> None:
+    """中止时间窗内还在跑的 run，并留 500ms 让它们的 finalize 落库。
+
+    这 500ms 是有意义的：abort 之后 runner 还会补 `[已中止]` 文本 part / 死消息，
+    不等就会漏删，客户端就会看到一个「撤回后残留的半截回复」。
+    """
+    comparison = AgentRun.started_at >= since_ms if inclusive else AgentRun.started_at > since_ms
+    runs = list(
+        await session.scalars(
+            select(AgentRun).where(
+                AgentRun.conversation_id == conversation_id,
+                comparison,
+                AgentRun.status == "running",
+            )
+        )
+    )
+    if not runs:
+        return
+    for row in runs:
+        abort_run(row.id)
+    await asyncio.sleep(0.5)
+
+
+async def _delete_message_window(
+    session: AsyncSession, conversation_id: str, since_ms: int, *, inclusive: bool
+) -> list[Message]:
+    """删除时间窗内的消息 + 它们的产物 + run，返回被删掉的消息行（含 parts）。"""
+    message_window = Message.created_at >= since_ms if inclusive else Message.created_at > since_ms
+    messages = list(
+        await session.scalars(
+            select(Message).where(Message.conversation_id == conversation_id, message_window)
+        )
+    )
+    run_window = (
+        AgentRun.started_at >= since_ms if inclusive else AgentRun.started_at > since_ms
+    )
+    runs = list(
+        await session.scalars(
+            select(AgentRun).where(AgentRun.conversation_id == conversation_id, run_window)
+        )
+    )
+    artifact_ids = _artifact_ids_in(messages)
+
+    if messages:
+        await session.execute(sa_delete(Message).where(Message.id.in_([m.id for m in messages])))
+    if artifact_ids:
+        await session.execute(sa_delete(Artifact).where(Artifact.id.in_(artifact_ids)))
+    if runs:
+        await session.execute(sa_delete(AgentRun).where(AgentRun.id.in_([r.id for r in runs])))
+    await session.commit()
+
+    # 先落库再广播：其它已连接客户端据此实时移除被撤回的消息与产物
+    event_bus.publish(
+        MessageRemovedEvent(
+            conversationId=conversation_id,
+            timestamp=now_ms(),
+            messageIds=[m.id for m in messages],
+            artifactIds=artifact_ids,
+        )
+    )
+    return messages
+
+
+async def withdraw_latest_user_message(
+    session: AsyncSession, conversation_id: str, message_id: str
+) -> dict[str, Any]:
+    """撤回最后一条 user 消息：连同它之后的所有消息 / 产物 / run 一起删掉。
+
+    时间窗用 `>=`（含触发消息本身）；只允许撤回**最后一条** user 消息，
+    避免「撤一条老的、留下上下文空洞」。
+    """
+    message = await session.scalar(
+        select(Message).where(
+            Message.id == message_id, Message.conversation_id == conversation_id
+        )
+    )
+    if message is None:
+        raise NotFoundError(f"Message not found: {message_id}")
+    if message.role != "user":
+        raise ServiceError("Only user messages can be withdrawn")
+
+    latest_user = await session.scalar(
+        select(Message)
+        .where(Message.conversation_id == conversation_id, Message.role == "user")
+        .order_by(Message.created_at.desc())
+        .limit(1)
+    )
+    if latest_user is None or latest_user.id != message_id:
+        raise ServiceError("Only the latest user message can be withdrawn")
+
+    await _abort_runs_since(session, conversation_id, message.created_at, inclusive=True)
+    deleted = await _delete_message_window(
+        session, conversation_id, message.created_at, inclusive=True
+    )
+    return {
+        "deletedMessageIds": [m.id for m in deleted],
+        "deletedArtifactIds": _artifact_ids_in(deleted),
+    }
+
+
+async def regenerate_latest_response(session: AsyncSession, conversation_id: str) -> dict[str, Any]:
+    """重新生成最后一次回复：保留最后一条 user 消息，删它之后的回复并重新起 run。"""
+    conv = await _conversation_or_404(session, conversation_id)
+
+    latest_user = await session.scalar(
+        select(Message)
+        .where(Message.conversation_id == conversation_id, Message.role == "user")
+        .order_by(Message.created_at.desc())
+        .limit(1)
+    )
+    if latest_user is None:
+        raise ServiceError("No user message to regenerate from")
+
+    # 时间窗用 `>`（保留触发消息本身）
+    await _abort_runs_since(session, conversation_id, latest_user.created_at, inclusive=False)
+    deleted = await _delete_message_window(
+        session, conversation_id, latest_user.created_at, inclusive=False
+    )
+
+    agents_in_conv = await _agents_in_conversation(session, list(conv.agent_ids))
+    responders = decide_responders(
+        conv, list(latest_user.mentioned_agent_ids or []), agents_in_conv
+    )
+    run_ids = [
+        start_run(
+            conversation_id=conversation_id,
+            agent_id=agent_id,
+            trigger_message_id=latest_user.id,
+        )
+        for agent_id in responders
+    ]
+    return {
+        "deletedMessageIds": [m.id for m in deleted],
+        "deletedArtifactIds": _artifact_ids_in(deleted),
+        "triggerMessageId": latest_user.id,
+        "runIds": run_ids,
+    }
+
+
+async def edit_and_resend_latest_user_message(
+    session: AsyncSession, conversation_id: str, message_id: str, new_content: str
+) -> dict[str, Any]:
+    """编辑最后一条 user 消息：撤回原消息，再用新内容重发（保留原 @、parent、附件）。"""
+    trimmed = new_content.strip()
+    if not trimmed:
+        raise ServiceError("Content cannot be empty")
+
+    original = await session.scalar(
+        select(Message).where(
+            Message.id == message_id, Message.conversation_id == conversation_id
+        )
+    )
+    if original is None:
+        raise NotFoundError(f"Message not found: {message_id}")
+    if original.role != "user":
+        raise ServiceError("Only user messages can be edited")
+
+    attachment_ids = [
+        part["attachmentId"]
+        for part in original.parts or []
+        if part.get("type") in ("image_attachment", "file_attachment") and part.get("attachmentId")
+    ]
+
+    withdrawn = await withdraw_latest_user_message(session, conversation_id, message_id)
+
+    sent = await send_message(
+        session,
+        {
+            "conversation_id": conversation_id,
+            "content": trimmed,
+            "mentioned_agent_ids": list(original.mentioned_agent_ids or []),
+            "parent_message_id": original.parent_message_id,
+            "attachment_ids": attachment_ids or None,
+        },
+    )
+
+    new_row = await session.scalar(select(Message).where(Message.id == sent["messageId"]))
+    if new_row is None:
+        raise ServiceError("New message disappeared after insert")
+
+    return {
+        **withdrawn,
+        "newMessage": MessageOut.model_validate(new_row).model_dump(by_alias=True),
+        "runIds": sent["runIds"],
+    }

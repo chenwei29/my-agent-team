@@ -9,6 +9,7 @@ from __future__ import annotations
 from app.tools.artifacts import READ_ARTIFACT_TOOL, WRITE_ARTIFACT_TOOL
 from app.tools.ask_user import ASK_USER_TOOL
 from app.tools.bash import BASH_TOOL
+from app.tools.deploy import DEPLOY_ARTIFACT_TOOL, DEPLOY_WORKSPACE_TOOL
 from app.tools.fs_list import FS_LIST_TOOL
 from app.tools.fs_read import FS_READ_TOOL
 from app.tools.fs_write import FS_WRITE_TOOL
@@ -25,6 +26,8 @@ _BUILTIN_TOOLS = (
     READ_ATTACHMENT_TOOL,
     READ_ARTIFACT_TOOL,
     WRITE_ARTIFACT_TOOL,
+    DEPLOY_ARTIFACT_TOOL,
+    DEPLOY_WORKSPACE_TOOL,
     PLAN_TASKS_TOOL,
 )
 

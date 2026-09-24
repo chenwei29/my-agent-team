@@ -1,21 +1,25 @@
 """产物工具：write_artifact（创建/新版本）与 read_artifact（同会话读取）。
 
 write_artifact 只写 DB 并返回 artifactId，不发 artifact.create 事件——
-事件接线是后续阶段 adapter 的职责（保证事件流单一来源）。
+事件接线是 adapter 的职责（保证事件流单一来源）。
 
-P4 阶段 content 只做「必须是 JSON 对象」的最小校验（DB 列就是 JSON dict）；
-按 type 的内容规整留给产物渲染阶段。
+内容规整走 build_artifact_content（与用户面板的「提交为新版本」共用同一校验来源）；
+content 允许是字符串（模型偶尔把对象 JSON.stringify 成串，规整层会保守解包救回）。
 """
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from sqlalchemy import select
 
 from app.db.models import Artifact
 from app.db.session import SessionLocal
+from app.services.artifact_content import (
+    build_artifact_content,
+    describe_artifact_content_error,
+)
 from app.tools.types import ToolContext, ToolDef, ToolResult
 from app.utils.ids import new_artifact_id
 from app.utils.time import now_ms
@@ -28,7 +32,7 @@ class WriteArtifactArgs(BaseModel):
 
     type: ArtifactType
     title: str
-    content: object = None
+    content: Any = None
     output_key: str | None = Field(default=None, alias="outputKey")
     parent_artifact_id: str | None = Field(default=None, alias="parentArtifactId")
 
@@ -45,12 +49,13 @@ async def _write_artifact(args: dict, ctx: ToolContext) -> ToolResult:
     except ValidationError as err:
         return ToolResult(ok=False, error=f"Invalid args: {err}")
 
-    if not isinstance(parsed.content, dict):
+    full_content = build_artifact_content(parsed.type, parsed.content)
+    if full_content is None:
         return ToolResult(
             ok=False,
             error=(
-                f"Invalid content for type {parsed.type}: "
-                "content must be a JSON object, not a string"
+                describe_artifact_content_error(parsed.type, parsed.content)
+                or f"Invalid content for type {parsed.type}"
             ),
         )
 
@@ -76,7 +81,7 @@ async def _write_artifact(args: dict, ctx: ToolContext) -> ToolResult:
         conversation_id=ctx.conversation_id,
         type=parsed.type,
         title=parsed.title,
-        content=parsed.content,
+        content=full_content,
         version=version,
         parent_artifact_id=resolved_parent,
         created_by_agent_id=ctx.agent_id,
@@ -144,8 +149,8 @@ WRITE_ARTIFACT_TOOL = ToolDef(
                 "enum": ["web_app", "document", "image", "ppt", "diagram"],
                 "description": (
                     "web_app for HTML/CSS/JS bundles, document for markdown text, "
-                    "image for URL or data URI, ppt for slide decks (structured JSON), "
-                    "diagram for Mermaid diagrams"
+                    "image for URL or data URI, ppt for slide decks (structured JSON, "
+                    "exportable to a real .pptx), diagram for Mermaid diagrams"
                 ),
             },
             "title": {"type": "string", "description": "Short human-readable title"},
@@ -153,10 +158,31 @@ WRITE_ARTIFACT_TOOL = ToolDef(
                 "type": "object",
                 "description": (
                     'Artifact body — pass as a JSON OBJECT, do NOT JSON-stringify it into a '
-                    'quoted string. For web_app: { files: { "index.html": "..." }, entry: '
-                    '"index.html" }. For document: { format: "markdown", content: "..." }. '
-                    'For image: { url: "...", alt: "..." }. For diagram: { syntax: '
-                    '"mermaid", source: "flowchart TD\\nA --> B" }.'
+                    'quoted string. For web_app: { files: { "index.html": "...", "style.css"?, '
+                    '"script.js"? }, entry: "index.html" }. For document: { format: "markdown", '
+                    'content: "...markdown text..." }. For image: { url: "...", alt: "..." }. '
+                    'For diagram: { syntax: "mermaid", source: "flowchart TD\\nA[\\"中文 / '
+                    'formula O(N^2)\\"] --> B[\\"结果\\"]", theme?: '
+                    '"default"|"base"|"dark"|"forest"|"neutral" }. Diagram source is preflighted: '
+                    'quote labels with Chinese/math/symbols as A["..."], use one edge per line, '
+                    'omit ```mermaid fences, and if the tool returns Invalid Mermaid diagram, '
+                    "fix source and call again. For ppt: { title?, theme?: { primary?: "
+                    '"1A3C6E", background?: "F8F9FA", surface?: "FFFFFF", textBody?: "2C3E50", '
+                    'textMuted?: "95A5A6", accentPositive?: "2B7A4B", accentNegative?: "C0392B", '
+                    'divider?: "E0E4E8", fontHeading?: "Inter", fontBody?: "Inter" }, slides: '
+                    '[{ title?, subtitle?, layout?: "title"|"title-bullets"|"section"|"blank"|'
+                    '"content"|"two-column"|"metrics"|"timeline"|"quote", blocks?: [{ type: '
+                    '"heading", text, level? }, { type: "paragraph", text }, { type: "bullets", '
+                    "items, ordered? }, { type: \"metric\", label, value, change?, tone? }, "
+                    '{ type: "quote", text, attribution? }, { type: "timeline", items: [{ label, '
+                    'title?, text? }] }, { type: "columns", columns: [{ title?, blocks: '
+                    '[{ type: "paragraph"|"bullets"|"metric"|"callout", ... }] }] }, { type: '
+                    '"callout", title?, text, tone? }, { type: "divider" }, { type: "spacer", '
+                    "size? }], notes? }] }. Legacy slides with bullets are still accepted, but "
+                    "prefer blocks for polished decks. Hex colors have no \"#\"; ppt JSON must "
+                    "not embed raw base64/data URI assets. Common mistake to avoid: sending "
+                    'content as a string like "{\\"format\\":\\"markdown\\",...}" — send the raw '
+                    "object, not its JSON text."
                 ),
             },
             "parentArtifactId": {
@@ -169,7 +195,11 @@ WRITE_ARTIFACT_TOOL = ToolDef(
             },
             "outputKey": {
                 "type": "string",
-                "description": "Optional handoff key for downstream task consumption.",
+                "description": (
+                    "Optional Orchestrator handoff key. When your task declares "
+                    "expectedOutputs, pass the matching expectedOutputs.id so downstream "
+                    "tasks can consume this artifact reliably."
+                ),
             },
         },
     },

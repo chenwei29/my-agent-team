@@ -16,10 +16,13 @@ from fastapi.responses import JSONResponse
 
 from app.api import (
     agents,
+    artifacts,
     attachments,
     conversation_fs,
     conversations,
+    deployments,
     fs,
+    message_ops,
     messages,
     pending_bash_commands,
     pending_questions,
@@ -70,10 +73,13 @@ app.add_middleware(
 )
 
 app.include_router(agents.router)
+app.include_router(artifacts.router)
 app.include_router(attachments.conv_router)
 app.include_router(attachments.item_router)
 app.include_router(conversations.router)
 app.include_router(conversation_fs.router)
+app.include_router(deployments.router)
+app.include_router(message_ops.router)
 app.include_router(messages.router)
 app.include_router(pending_bash_commands.router)
 app.include_router(pending_questions.router)

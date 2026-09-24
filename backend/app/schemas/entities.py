@@ -140,6 +140,12 @@ class SendMessageResponse(CamelModel):
     message_id: str
     run_ids: list[str]
     messages: list[MessageOut] | None = None
+    # 内容形如 /deploy 的指令消息不发 run，而是当场部署并把结果挂在这里
+    deploy: dict[str, Any] | None = None
+
+
+class DeployCandidatesResponse(CamelModel):
+    candidates: list[dict[str, Any]]
 
 
 class ClearHistoryResponse(CamelModel):
@@ -252,6 +258,23 @@ class SendMessageBody(CamelModel):
         if not self.content.strip() and not self.attachment_ids:
             raise ValueError("必须提供 content 或 attachmentIds 之一")
         return self
+
+
+# ─── 请求体：部署 ──────────────────────────────────────────
+class DeployConversationBody(CamelModel):
+    """空对象也是合法请求体（走自动判定候选）。"""
+
+    artifact_id: Annotated[str, Field(min_length=1)] | None = None
+
+
+# ─── 请求体：消息高级操作（撤回 / 编辑 / pin / bookmark）─────
+class WithdrawMessageBody(CamelModel):
+    conversation_id: Annotated[str, Field(min_length=1)]
+
+
+class EditMessageBody(CamelModel):
+    conversation_id: Annotated[str, Field(min_length=1)]
+    content: Annotated[str, Field(min_length=1)]
 
 
 # ─── 请求体：Settings ───────────────────────────────────────

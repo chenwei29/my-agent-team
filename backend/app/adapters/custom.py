@@ -27,8 +27,13 @@ from openai import AsyncOpenAI
 
 from app.adapters.custom_provider_client import resolve_custom_provider_client_config
 from app.adapters.types import AdapterInput
+from app.db.models import Artifact
+from app.db.session import SessionLocal
 from app.errors import ServiceError
 from app.schemas.events import (
+    ArtifactCreateEvent,
+    ArtifactRecord,
+    DeployStatusEvent,
     MessageEndEvent,
     MessageStartEvent,
     MessageUsageEvent,
@@ -330,6 +335,23 @@ class CustomAgentAdapter:
                     isError=not result.ok,
                 )
 
+                # 工具只写 DB，**不发** artifact.create / deploy.status —— 由这里统一发，
+                # 事件流才有单一来源；runner 收到后会往消息里注入对应的 part。
+                if result.ok and isinstance(value, dict):
+                    if tc["name"] == "write_artifact" and value.get("artifactId"):
+                        artifact_event = await _load_artifact_event(
+                            input.conversationId, value["artifactId"]
+                        )
+                        if artifact_event is not None:
+                            yield artifact_event
+                    elif tc["name"] in ("deploy_artifact", "deploy_workspace") and value.get("id"):
+                        yield DeployStatusEvent(
+                            conversationId=input.conversationId,
+                            timestamp=now_ms(),
+                            messageId=message_id,
+                            deployment=value,
+                        )
+
                 messages.append(
                     {
                         "role": "tool",
@@ -360,6 +382,31 @@ class CustomAgentAdapter:
 
 
 # ─── 辅助 ────────────────────────────────────────────────
+
+
+async def _load_artifact_event(
+    conversation_id: str, artifact_id: str
+) -> ArtifactCreateEvent | None:
+    """工具只返回 artifactId，事件里要带完整记录，所以回查一次 DB。"""
+    async with SessionLocal() as session:
+        row = await session.get(Artifact, artifact_id)
+    if row is None:
+        return None
+    return ArtifactCreateEvent(
+        conversationId=conversation_id,
+        timestamp=now_ms(),
+        artifact=ArtifactRecord(
+            id=row.id,
+            conversationId=row.conversation_id,
+            type=row.type,
+            title=row.title,
+            content=row.content,
+            version=row.version,
+            parentArtifactId=row.parent_artifact_id,
+            createdByAgentId=row.created_by_agent_id,
+            createdAt=row.created_at,
+        ),
+    )
 
 
 def build_client(provider: str, override_key: str | None, api_base_url: str | None) -> AsyncOpenAI:
