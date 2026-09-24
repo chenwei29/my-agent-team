@@ -38,6 +38,7 @@ from app.security.workspace_utils import is_path_safe
 from app.services import deploy_command_service
 from app.services.agent_runner import abort_run, start_run
 from app.services.event_bus import event_bus
+from app.services.pending_dispatch_plans import pending_dispatch_plans
 from app.utils.ids import new_conversation_id, new_message_id, new_workspace_id
 from app.utils.time import now_ms
 
@@ -453,6 +454,56 @@ async def send_message(session: AsyncSession, args: dict[str, Any]) -> dict[str,
     ]
 
     return {"messageId": message_id, "runIds": run_ids}
+
+
+async def revise_dispatch_plan(
+    session: AsyncSession, conversation_id: str, plan_id: str, feedback: str
+) -> dict[str, Any]:
+    """对话式修改待审计划：反馈作为一条 user 消息落库并广播（进对话、跨端可见），
+    再交回正在等待的编排 run 重排。不触发新 run（现有 run 会自己续上并发出新计划）。"""
+    pending = pending_dispatch_plans.get(plan_id)
+    if pending is None or pending.conversationId != conversation_id:
+        return {"ok": False, "error": "Pending dispatch plan not found"}
+
+    message_id = new_message_id()
+    now = now_ms()
+    parts: list[dict[str, Any]] = [{"type": "text", "content": feedback}]
+
+    message = Message(
+        id=message_id,
+        conversation_id=conversation_id,
+        role="user",
+        agent_id=None,
+        parts=parts,
+        status="complete",
+        parent_message_id=None,
+        mentioned_agent_ids=[],
+        run_id=None,
+        usage=None,
+        created_at=now,
+    )
+    session.add(message)
+    await session.execute(
+        sa_update(Conversation)
+        .where(Conversation.id == conversation_id)
+        .values(updated_at=now)
+    )
+    await session.commit()
+
+    event_bus.publish(
+        MessageAddedEvent(
+            conversationId=conversation_id,
+            timestamp=now,
+            message=_message_record(message),
+        )
+    )
+
+    ok = pending_dispatch_plans.revise(plan_id, feedback)
+    return (
+        {"ok": True}
+        if ok
+        else {"ok": False, "error": "Failed to revise pending dispatch plan"}
+    )
 
 
 def _message_record(row: Message) -> MessageRecord:

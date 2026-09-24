@@ -9,7 +9,10 @@ import asyncio
 
 from pydantic import BaseModel, ConfigDict, ValidationError
 
+from app.schemas.dispatch import RunFileEvidence
 from app.security.workspace_utils import assert_path_within_workspace
+from app.services.dispatch_file_writes import record_file_write
+from app.services.dispatch_run_evidence import record_run_file_write
 from app.services.fs_service import (
     get_conversation_approval_mode,
     get_workspace_for_conversation,
@@ -40,16 +43,27 @@ async def _handle(args: dict, ctx: ToolContext) -> ToolResult:
     mode = await get_conversation_approval_mode(ctx.conversation_id)
 
     if mode == "auto":
-        return _write_now(workspace, parsed.path, parsed.content)
+        return _write_now(ctx, workspace, parsed.path, parsed.content)
     return await _review_write(ctx, workspace, parsed.path, parsed.content)
 
 
-def _write_now(workspace, path: str, content: str) -> ToolResult:
+def _write_now(ctx: ToolContext, workspace, path: str, content: str) -> ToolResult:
     try:
         value = write_file_in_workspace(workspace, path, content)
     except Exception as err:
         return ToolResult(ok=False, error=str(err))
     value["applied"] = "auto"
+    # 落盘即记写入证据：冲突检测按 run 归档绝对路径，证据门禁按 run 索引文件改动
+    record_file_write(ctx.run_id, value["absolutePath"], content)
+    record_run_file_write(
+        ctx.run_id,
+        RunFileEvidence(
+            path=path,
+            absolutePath=value["absolutePath"],
+            bytes=value["bytes"],
+            applied="auto",
+        ),
+    )
     return ToolResult(ok=True, value=value)
 
 
@@ -93,6 +107,17 @@ async def _review_write(ctx: ToolContext, workspace, path: str, content: str) ->
 
     if not decision.get("applied"):
         return ToolResult(ok=False, error="User rejected the file change")
+
+    record_file_write(ctx.run_id, absolute_path, content)
+    record_run_file_write(
+        ctx.run_id,
+        RunFileEvidence(
+            path=path,
+            absolutePath=absolute_path,
+            bytes=len(content.encode("utf-8")),
+            applied="review",
+        ),
+    )
 
     return ToolResult(
         ok=True,

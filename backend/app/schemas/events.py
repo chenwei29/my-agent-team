@@ -18,6 +18,12 @@ from typing import Annotated, Any, Literal, Union
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from app.schemas.dispatch import (
+    DispatchPlanItem,
+    DispatchTaskEndStatus,
+    PendingDispatchPlan,
+)
+
 RunStatus = Literal["complete", "failed", "aborted"]
 MessageRole = Literal["user", "agent", "system"]
 MessageStatus = Literal["streaming", "complete", "error", "aborted"]
@@ -254,34 +260,8 @@ class PendingQuestion(BaseModel):
     createdAt: int
 
 
-class DispatchPlanItem(BaseModel):
-    """分派计划里的一条子任务：负责的 agent、任务描述、依赖、期望产出与验收标准；P6 落地，若干枚举字段先用 str。"""
-
-    model_config = ConfigDict(extra="forbid")
-    id: str
-    agentId: str
-    task: str
-    taskKind: str | None = None
-    dependsOn: list[str] | None = None
-    expectedOutputs: list[str] | None = None
-    inputs: list[dict[str, Any]] | None = None
-    acceptanceCriteria: list[str] | None = None
-    targetPaths: list[str] | None = None
-    expectedWorkspaceChanges: list[str] | None = None
-    requiredCommands: list[dict[str, Any]] | None = None
-    requiredEvidence: list[str] | None = None
-
-
-class PendingDispatchPlan(BaseModel):
-    """等待用户确认的整份分派计划（dispatch.plan.pending 的 payload）；P6 落地。"""
-
-    model_config = ConfigDict(extra="forbid")
-    id: str
-    conversationId: str
-    agentId: str
-    runId: str
-    plan: list[DispatchPlanItem]
-    createdAt: int
+# 分派计划 / 任务结果的结构定义在 schemas/dispatch.py（P6 收紧），这里直接引用，
+# 保证事件 payload 与调度纯函数用的是同一份模型。
 
 
 # ─── 事件基类：除 connected / heartbeat 外都带这两个字段 ──────
@@ -425,7 +405,7 @@ class DispatchEndEvent(_Event):
     type: Literal["dispatch.end"] = "dispatch.end"
     parentRunId: str
     taskId: str
-    status: str
+    status: DispatchTaskEndStatus
     childRunId: str | None = None
     error: str | None = None
 

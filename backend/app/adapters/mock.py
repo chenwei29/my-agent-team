@@ -1,10 +1,12 @@
 """MockAdapter —— 不调用真实 LLM 的假实现，事件序列与真实 adapter 同构。
 
-按 prompt 关键词选脚本，字符级流式吐事件（每 15–20ms 一个 chunk）。
+按输入形态选脚本，字符级流式吐事件（每 15–20ms 一个 chunk）。
 用途是端到端骨架验证（SSE / store / 打字机渲染）与 e2e 的确定性回复。
 
 行为要点（改这里前先对齐下面这些约束）：
-- 关键词顺序：greeting → code → tool → default，**第一个匹配即返回**；
+- 脚本选择：编排形态优先（工具集含 plan_tasks → 计划脚本；含 report_task_result →
+  上报脚本；system prompt 含「聚合阶段」→ 总结脚本），然后才是关键词正则：
+  greeting → code → tool → default，**第一个匹配即返回**；
 - chunk 大小：text 4、thinking 8、code 8；sleep：text 20ms、thinking/code 15ms、tool 300ms；
 - sleep 在**每个** chunk 之前（含第一个）；
 - `partIndex` 是**脚本步序号**（含 tool 步），不是 parts 数组下标；
@@ -125,8 +127,83 @@ _GREETING_RE = re.compile(r"(你好|hello|hi|您好)")
 _CODE_RE = re.compile(r"(写代码|代码|code|component|组件)")
 _TOOL_RE = re.compile(r"(执行|工具|tool|run|跑)")
 
+# ─── 编排脚本（按工具集 / system prompt 识别，优先于关键词正则）─────
 
-def pick_script(prompt: str) -> list[ScriptStep]:
+# 固定的 3 任务 2 波次计划：t1 先跑，t2/t3 并发跟上。
+# 任务文本刻意避开「代码类任务」关键词（实现/开发/前端/…），保持纯文本任务语义。
+_ORCHESTRATOR_PLAN_ARGS: dict[str, Any] = {
+    "tasks": [
+        {"id": "t1", "agentId": "ag_worker_1", "task": "梳理需求要点"},
+        {"id": "t2", "agentId": "ag_worker_2", "task": "整理要点清单", "dependsOn": ["t1"]},
+        {"id": "t3", "agentId": "ag_worker_3", "task": "汇总检查结果", "dependsOn": ["t1"]},
+    ]
+}
+
+_REVISION_REQUEST_RE = re.compile(
+    r"<user_revision_request>\n?(.*?)\n?</user_revision_request>", re.DOTALL
+)
+
+
+def _orchestrator_plan_script(prompt: str) -> list[ScriptStep]:
+    """plan 阶段脚本：吐一次 plan_tasks 就结束（编排侧会拿它收工）。
+
+    带修改意见（<user_revision_request>）时把意见回填进 t1 的任务文本，
+    让「重排后的计划反映用户反馈」可以被确定性断言。
+    """
+    import copy
+
+    plan_args = copy.deepcopy(_ORCHESTRATOR_PLAN_ARGS)
+    match = _REVISION_REQUEST_RE.search(prompt)
+    if match:
+        feedback = match.group(1).strip()
+        if feedback:
+            plan_args["tasks"][0]["task"] = f'梳理需求要点（按用户反馈调整：{feedback}）'
+    return [
+        ThinkingStep("用户需求明确，我拆解成分派计划。"),
+        TextStep("我来把工作拆成三个子任务："),
+        ToolStep("plan_tasks", plan_args, {"acknowledged": True, "taskCount": 3}),
+    ]
+
+
+ORCHESTRATOR_PLAN_SCRIPT: list[ScriptStep] = _orchestrator_plan_script("")
+
+SUB_AGENT_REPORT_SCRIPT: list[ScriptStep] = [
+    ThinkingStep("任务处理完毕，按要求上报结果。"),
+    TextStep("任务已处理完毕，上报结构化结果。"),
+    ToolStep(
+        "report_task_result",
+        {"status": "complete", "summary": "已按任务要求处理完毕"},
+        {"status": "complete", "summary": "已按任务要求处理完毕"},
+    ),
+]
+
+AGGREGATE_SCRIPT: list[ScriptStep] = [
+    ThinkingStep("所有子任务已结束，我来给用户做最终总结。"),
+    TextStep(
+        "各子任务已执行完毕，这是最终总结：\n\n"
+        "- t1 需求梳理：完成\n"
+        "- t2 要点整理：完成\n"
+        "- t3 结果汇总：完成\n\n"
+        "产物已按依赖交接，可继续追加后续指令。"
+    ),
+]
+
+
+def pick_script(
+    prompt: str, tool_names: list[str] | None = None, system_prompt: str = ""
+) -> list[ScriptStep]:
+    """脚本选择：编排形态（工具集 / 阶段标记）优先于关键词正则。
+
+    计划阶段的 prompt 含「执行」等词、聚合阶段同理 —— 若先跑正则会误入 tool/code
+    脚本，所以 plan_tasks / report_task_result / 聚合阶段 的判定必须排在最前。
+    """
+    tools = set(tool_names or ())
+    if "plan_tasks" in tools:
+        return _orchestrator_plan_script(prompt)
+    if "report_task_result" in tools:
+        return SUB_AGENT_REPORT_SCRIPT
+    if "聚合阶段" in system_prompt:
+        return AGGREGATE_SCRIPT
     p = prompt.lower()
     if _GREETING_RE.search(p):
         return GREETING_SCRIPT
@@ -151,7 +228,7 @@ class MockAdapter:
     name = "mock"
 
     async def stream(self, input: AdapterInput, signal: AbortSignal) -> AsyncIterator[StreamEvent]:
-        script = pick_script(input.prompt)
+        script = pick_script(input.prompt, input.toolNames, input.systemPrompt)
 
         message_id = new_message_id()
         conv = input.conversationId

@@ -31,6 +31,8 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from app.security.bash_approval import classify_bash_approval
 from app.security.shell_bans import find_banned_pattern
 from app.security.workspace_utils import assert_path_within_workspace, get_effective_cwd
+from app.schemas.dispatch import RunCommandEvidence
+from app.services.dispatch_run_evidence import record_run_command
 from app.services.fs_service import get_workspace_for_conversation
 from app.services.pending_bash_commands import pending_bash_commands
 from app.tools.types import ToolContext, ToolDef, ToolResult
@@ -108,7 +110,14 @@ async def _drain_pipe(stream, state: dict) -> None:
             state["buffer"] = combined
 
 
-async def _run_shell_command(command: str, cwd: str, timeout_ms: int, abort_signal) -> dict:
+async def _run_shell_command(
+    command: str,
+    cwd: str,
+    timeout_ms: int,
+    abort_signal,
+    run_id: str | None = None,
+    evidence_kind: str | None = None,
+) -> dict:
     timeout_s = timeout_ms / 1000
     state: dict[str, Any] = {"buffer": "", "truncated": False}
     timed_out = False
@@ -126,6 +135,16 @@ async def _run_shell_command(command: str, cwd: str, timeout_ms: int, abort_sign
             start_new_session=(PLATFORM != "windows"),
         )
     except OSError as err:
+        _record_command_evidence(
+            run_id,
+            command=command,
+            cwd=cwd,
+            exit_code=None,
+            timed_out=False,
+            is_error=True,
+            evidence_kind=evidence_kind,
+            error=str(err),
+        )
         return {"spawnFailed": str(err)}
 
     def _on_abort() -> None:
@@ -175,6 +194,15 @@ async def _run_shell_command(command: str, cwd: str, timeout_ms: int, abort_sign
     if orphaned_stdio:
         output += "\n\n[STOPPED background processes after shell exit to close inherited stdio]"
 
+    _record_command_evidence(
+        run_id,
+        command=command,
+        cwd=cwd,
+        exit_code=returncode,
+        timed_out=timed_out,
+        is_error=False,
+        evidence_kind=evidence_kind,
+    )
     return {
         "cwd": cwd,
         "command": command,
@@ -185,13 +213,58 @@ async def _run_shell_command(command: str, cwd: str, timeout_ms: int, abort_sign
     }
 
 
+def _record_command_evidence(
+    run_id: str | None,
+    *,
+    command: str,
+    cwd: str,
+    exit_code: int | None,
+    timed_out: bool,
+    is_error: bool,
+    evidence_kind: str | None,
+    error: str | None = None,
+) -> None:
+    """执行过的命令按 run 记证据；prepare 标记区分准备命令与验证命令。"""
+    if run_id is None:
+        return
+    record_run_command(
+        run_id,
+        RunCommandEvidence(
+            command=command,
+            cwd=cwd,
+            exitCode=exit_code,
+            timedOut=timed_out,
+            isError=is_error,
+            prepare=True if evidence_kind == "prepare" else None,
+            error=error,
+        ),
+    )
+
+
 async def _handle(args: dict, ctx: ToolContext) -> ToolResult:
     try:
         parsed = BashArgs.model_validate(args or {})
     except ValidationError as err:
         return ToolResult(ok=False, error=f"Invalid args: {err}")
+    return await execute_bash_command(
+        parsed.command, parsed.cwd, parsed.timeout_ms, ctx
+    )
 
-    banned = find_banned_pattern(parsed.command, PLATFORM)
+
+async def execute_bash_command(
+    command: str,
+    cwd: str | None,
+    timeout_ms: int | None,
+    ctx: ToolContext,
+    *,
+    evidence_kind: str | None = None,
+) -> ToolResult:
+    """执行链与 bash 工具入口一致：黑名单 → workspace/cwd → 审批 → 子进程。
+
+    调度器补跑 requiredCommands 也走这里（evidence_kind='prepare'/'verification'），
+    保证验证命令和工具命令过的是同一套安全检查。
+    """
+    banned = find_banned_pattern(command, PLATFORM)
     if banned is not None:
         return ToolResult(ok=False, error=f"Command rejected by safety policy: {banned.pattern}")
 
@@ -199,24 +272,31 @@ async def _handle(args: dict, ctx: ToolContext) -> ToolResult:
     if workspace is None:
         return ToolResult(ok=False, error="Workspace not found")
 
-    cwd = get_effective_cwd(workspace)
-    if parsed.cwd:
+    effective_cwd = get_effective_cwd(workspace)
+    if cwd:
         try:
-            resolved_cwd = assert_path_within_workspace(workspace, parsed.cwd)
+            resolved_cwd = assert_path_within_workspace(workspace, cwd)
         except Exception as err:
             return ToolResult(ok=False, error=str(err))
         if not os.path.isdir(resolved_cwd):
-            return ToolResult(ok=False, error=f"cwd is not a directory: {parsed.cwd}")
-        cwd = resolved_cwd
+            return ToolResult(ok=False, error=f"cwd is not a directory: {cwd}")
+        effective_cwd = resolved_cwd
 
-    approval = classify_bash_approval(parsed.command, PLATFORM)
+    approval = classify_bash_approval(command, PLATFORM)
     if approval.required:
-        decision = await _wait_bash_approval(ctx, parsed.command, cwd, approval.reason)
+        decision = await _wait_bash_approval(ctx, command, effective_cwd, approval.reason)
         if decision is None or not decision.get("approved"):
             return ToolResult(ok=False, error=f"User rejected command execution: {approval.reason}")
 
-    timeout_ms = _clamp_timeout(parsed.timeout_ms)
-    result = await _run_shell_command(parsed.command, cwd, timeout_ms, ctx.abort_signal)
+    clamped_ms = _clamp_timeout(timeout_ms)
+    result = await _run_shell_command(
+        command,
+        effective_cwd,
+        clamped_ms,
+        ctx.abort_signal,
+        run_id=ctx.run_id,
+        evidence_kind=evidence_kind,
+    )
     if "spawnFailed" in result:
         return ToolResult(ok=False, error=f"Spawn failed: {result['spawnFailed']}")
     return ToolResult(ok=True, value=result)

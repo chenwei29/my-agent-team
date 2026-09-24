@@ -16,6 +16,7 @@ from app.tools.fs_write import FS_WRITE_TOOL
 from app.tools.plan_tasks import PLAN_TASKS_TOOL
 from app.tools.read_attachment import READ_ATTACHMENT_TOOL
 from app.tools.registry import tool_registry
+from app.tools.report_task_result import REPORT_TASK_RESULT_TOOL
 
 _BUILTIN_TOOLS = (
     FS_READ_TOOL,
@@ -29,6 +30,7 @@ _BUILTIN_TOOLS = (
     DEPLOY_ARTIFACT_TOOL,
     DEPLOY_WORKSPACE_TOOL,
     PLAN_TASKS_TOOL,
+    REPORT_TASK_RESULT_TOOL,
 )
 
 _registered = False

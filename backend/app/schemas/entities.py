@@ -338,6 +338,21 @@ class AnswerQuestionsBody(CamelModel):
     answers: dict[str, AskUserAnswerBody]
 
 
+class ReviewDispatchPlanBody(CamelModel):
+    """待审分派计划的审批请求体：approve/reject 不带额外字段；revise 必带 feedback。"""
+
+    action: Literal["approve", "reject", "revise"]
+    feedback: str | None = None
+
+    @model_validator(mode="after")
+    def _revise_needs_feedback(self) -> ReviewDispatchPlanBody:
+        if self.action == "revise" and (
+            self.feedback is None or not (1 <= len(self.feedback) <= 4000)
+        ):
+            raise ValueError("revise 需要 1-4000 字符的 feedback")
+        return self
+
+
 # ─── 附件 ──────────────────────────────────────────────────
 class AttachmentOut(CamelModel):
     model_config = ConfigDict(from_attributes=True)

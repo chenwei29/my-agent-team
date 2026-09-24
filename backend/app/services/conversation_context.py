@@ -9,7 +9,8 @@
 - pinned 消息无视截断永远注入（用户的 pin 是显式契约），且不被 token 预算丢弃；
 - 超预算时从老到新丢非 pinned 项。
 
-上下文摘要（compact）注入在后续阶段接入；本版本 summary 为空即无操作。
+上下文摘要：摘要的**生成**在后续阶段接入；读取最新摘要与渲染摘要块的辅助
+函数在本模块（子 Agent 上下文与 prompt 前缀会用到），summary 为空即无操作。
 """
 
 from __future__ import annotations
@@ -19,7 +20,7 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.db.models import Agent, Artifact, Conversation, Message
+from app.db.models import Agent, Artifact, ContextSummary, Conversation, Message
 from app.utils.model_registry import estimate_tokens
 
 DEFAULT_MAX_TURNS = 20
@@ -244,3 +245,31 @@ async def _load_artifact_titles(session: AsyncSession, ids: list[str]) -> dict[s
         select(Artifact.id, Artifact.title).where(Artifact.id.in_(ids))
     )
     return {r[0]: r[1] for r in result.all()}
+
+
+# ─── 上下文摘要（读取 + 渲染）────────────────────────────────
+
+
+async def get_latest_context_summary(
+    session: AsyncSession, conversation_id: str
+) -> ContextSummary | None:
+    """会话最新一份上下文摘要；没有就是 None。"""
+    return await session.scalar(
+        select(ContextSummary)
+        .where(ContextSummary.conversation_id == conversation_id)
+        .order_by(ContextSummary.created_at.desc())
+        .limit(1)
+    )
+
+
+def render_conversation_summary_block(summary: ContextSummary) -> str:
+    """摘要 → `<conversation_summary covered_until_message_id="...">` XML 块。"""
+    covered = summary.covered_until_message_id or ""
+    covered = covered.replace("&", "&amp;").replace('"', "&quot;").replace("<", "&lt;")
+    return "\n".join(
+        [
+            f'<conversation_summary covered_until_message_id="{covered}">',
+            summary.summary,
+            "</conversation_summary>",
+        ]
+    )

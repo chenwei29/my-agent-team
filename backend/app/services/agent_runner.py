@@ -50,10 +50,18 @@ from app.schemas.events import (
 from app.security.workspace_utils import get_effective_cwd
 from app.services import settings_service
 from app.services.conversation_context import build_history_for
+from app.services.dispatch_prompts import build_agent_hub_tool_guidance
+from app.services.dispatch_run_evidence import clear_run_tool_evidence, get_run_tool_evidence
 from app.services.event_bus import event_bus
 from app.services.pending_bash_commands import pending_bash_commands
 from app.services.pending_questions import pending_questions
 from app.services.pending_writes import pending_writes
+from app.services.project_artifact import maybe_create_project_artifact
+from app.services.task_result_report import (
+    REPORT_TASK_RESULT_TOOL_NAME,
+    is_task_result_report_tool_name,
+    read_task_result_report_from_tool_result,
+)
 from app.utils.abort import AbortSignal
 from app.utils.ids import new_run_id
 from app.utils.model_registry import estimate_tokens, get_model_limits
@@ -88,12 +96,78 @@ def start_run(
     trigger_message_id: str,
     parent_run_id: str | None = None,
     parent_signal: AbortSignal | None = None,
+    override_prompt: str | None = None,
+    override_system_prompt: str | None = None,
+    override_tool_names: list[str] | None = None,
+    require_task_report: bool = False,
 ) -> str:
-    """起一个 run 并**立刻返回 runId**（不等待结束，结果全靠 SSE 推）。"""
+    """起一个 run 并**立刻返回 runId**（不等待结束，结果全靠 SSE 推）。
+
+    parent_signal 用于级联中止：父 run 一 abort，子 run 立刻跟着 abort
+    （监听器在起跑前挂上；已中止的父 signal 直接把子 run 标成中止态）。
+
+    override_* 供编排使用：子任务/阶段用外部构造的 prompt、system prompt 与工具集；
+    require_task_report 时工具集里保证有 report_task_result。
+    """
+    run_id, _task = _spawn_run(
+        conversation_id=conversation_id,
+        agent_id=agent_id,
+        trigger_message_id=trigger_message_id,
+        parent_run_id=parent_run_id,
+        parent_signal=parent_signal,
+        override_prompt=override_prompt,
+        override_system_prompt=override_system_prompt,
+        override_tool_names=override_tool_names,
+        require_task_report=require_task_report,
+    )
+    return run_id
+
+
+def start_run_joined(
+    *,
+    conversation_id: str,
+    agent_id: str,
+    trigger_message_id: str,
+    parent_run_id: str | None = None,
+    parent_signal: AbortSignal | None = None,
+    override_prompt: str | None = None,
+    override_system_prompt: str | None = None,
+    override_tool_names: list[str] | None = None,
+    require_task_report: bool = False,
+) -> tuple[str, asyncio.Task[Any]]:
+    """同 start_run，但把内部 task 一并返回 —— 调度器要 await 子 run 的执行结果。"""
+    return _spawn_run(
+        conversation_id=conversation_id,
+        agent_id=agent_id,
+        trigger_message_id=trigger_message_id,
+        parent_run_id=parent_run_id,
+        parent_signal=parent_signal,
+        override_prompt=override_prompt,
+        override_system_prompt=override_system_prompt,
+        override_tool_names=override_tool_names,
+        require_task_report=require_task_report,
+    )
+
+
+def _spawn_run(
+    *,
+    conversation_id: str,
+    agent_id: str,
+    trigger_message_id: str,
+    parent_run_id: str | None = None,
+    parent_signal: AbortSignal | None = None,
+    override_prompt: str | None = None,
+    override_system_prompt: str | None = None,
+    override_tool_names: list[str] | None = None,
+    require_task_report: bool = False,
+) -> tuple[str, asyncio.Task[Any]]:
     run_id = new_run_id()
     signal = AbortSignal()
-    if parent_signal is not None and parent_signal.aborted:
-        signal.abort()
+    if parent_signal is not None:
+        if parent_signal.aborted:
+            signal.abort()
+        else:
+            parent_signal.add_listener(signal.abort)
 
     active_runs[run_id] = signal
 
@@ -105,16 +179,22 @@ def start_run(
             agent_id=agent_id,
             trigger_message_id=trigger_message_id,
             parent_run_id=parent_run_id,
+            override_prompt=override_prompt,
+            override_system_prompt=override_system_prompt,
+            override_tool_names=override_tool_names,
+            require_task_report=require_task_report,
         )
     )
 
     def _cleanup(finished: asyncio.Task) -> None:
         active_runs.pop(run_id, None)
+        if parent_signal is not None:
+            parent_signal.remove_listener(signal.abort)
         if not finished.cancelled() and finished.exception() is not None:
             logger.error("run %s crashed: %r", run_id, finished.exception())
 
     task.add_done_callback(_cleanup)
-    return run_id
+    return run_id, task
 
 
 def abort_run(run_id: str) -> bool:
@@ -129,6 +209,26 @@ def abort_run(run_id: str) -> bool:
 # ─── run 主流程 ─────────────────────────────────────────────
 
 
+def _run_result(
+    run_id: str,
+    status: str,
+    *,
+    error: str | None = None,
+    execution: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """一次 run 的语义结果（子 run 的 await 值；普通 run 由调用方忽略）。"""
+    execution = execution or {}
+    return {
+        "run_id": run_id,
+        "status": status,
+        "error": error,
+        "artifact_ids": list(execution.get("artifact_ids") or []),
+        "output_message_ids": list(execution.get("output_message_ids") or []),
+        "output_artifacts": dict(execution.get("output_artifacts") or {}),
+        "task_report": execution.get("task_report"),
+    }
+
+
 async def _execute_run(
     *,
     run_id: str,
@@ -137,7 +237,11 @@ async def _execute_run(
     agent_id: str,
     trigger_message_id: str,
     parent_run_id: str | None,
-) -> None:
+    override_prompt: str | None = None,
+    override_system_prompt: str | None = None,
+    override_tool_names: list[str] | None = None,
+    require_task_report: bool = False,
+) -> dict[str, Any]:
     async with SessionLocal() as session:
         try:
             agent = await session.scalar(select(Agent).where(Agent.id == agent_id))
@@ -152,22 +256,23 @@ async def _execute_run(
                     error=f"Agent not found: {agent_id}",
                     output_message_ids=[],
                 )
-                return
+                return _run_result(run_id, "failed", error=f"Agent not found: {agent_id}")
 
             workspace = await session.scalar(
                 select(Workspace).where(Workspace.conversation_id == conversation_id)
             )
             if workspace is None:
+                error = f"Workspace not found for conversation: {conversation_id}"
                 await _finalize(
                     session,
                     run_id=run_id,
                     conversation_id=conversation_id,
                     agent_id=agent_id,
                     status="failed",
-                    error=f"Workspace not found for conversation: {conversation_id}",
+                    error=error,
                     output_message_ids=[],
                 )
-                return
+                return _run_result(run_id, "failed", error=error)
 
             trigger = await session.scalar(
                 select(Message).where(
@@ -176,16 +281,17 @@ async def _execute_run(
                 )
             )
             if trigger is None:
+                error = f"Trigger message not found: {trigger_message_id}"
                 await _finalize(
                     session,
                     run_id=run_id,
                     conversation_id=conversation_id,
                     agent_id=agent_id,
                     status="failed",
-                    error=f"Trigger message not found: {trigger_message_id}",
+                    error=error,
                     output_message_ids=[],
                 )
-                return
+                return _run_result(run_id, "failed", error=error)
 
             # 1) run 行先落库
             session.add(
@@ -216,41 +322,59 @@ async def _execute_run(
                 )
             )
 
-            adapter = get_adapter(agent.adapter_name)
             conv = await session.scalar(
                 select(Conversation).where(Conversation.id == conversation_id)
             )
-            adapter_input = await _build_adapter_input(
-                session,
-                agent=agent,
-                conv=conv,
-                workspace=workspace,
-                trigger=trigger,
-                run_id=run_id,
+            prompt = override_prompt or _extract_text_from_parts(trigger.parts)
+            attachments = (
+                None
+                if override_prompt
+                else await _collect_attachments(session, trigger, workspace.root_path)
             )
 
-            result = await _consume_stream(session, adapter, adapter_input, signal, run_id)
+            if agent.is_orchestrator:
+                from app.services.orchestrator_runner import execute_orchestrator_run
 
-            if signal.aborted:
-                await _finalize(
+                execution = await execute_orchestrator_run(
                     session,
                     run_id=run_id,
-                    conversation_id=conversation_id,
-                    agent_id=agent_id,
-                    status="aborted",
-                    error=None,
-                    output_message_ids=result["output_message_ids"],
+                    signal=signal,
+                    agent=agent,
+                    conv=conv,
+                    workspace=workspace,
+                    trigger=trigger,
+                    user_prompt=prompt,
+                    attachments=attachments,
                 )
             else:
-                await _finalize(
+                execution = await _execute_simple_run(
                     session,
                     run_id=run_id,
-                    conversation_id=conversation_id,
-                    agent_id=agent_id,
-                    status="complete",
-                    error=None,
-                    output_message_ids=result["output_message_ids"],
+                    signal=signal,
+                    agent=agent,
+                    conv=conv,
+                    workspace=workspace,
+                    trigger=trigger,
+                    prompt=prompt,
+                    attachments=attachments,
+                    parent_run_id=parent_run_id,
+                    override_system_prompt=override_system_prompt,
+                    override_tool_names=override_tool_names,
+                    require_task_report=require_task_report,
+                    skip_history=override_prompt is not None,
                 )
+
+            status = "aborted" if signal.aborted else "complete"
+            await _finalize(
+                session,
+                run_id=run_id,
+                conversation_id=conversation_id,
+                agent_id=agent_id,
+                status=status,
+                error=None,
+                output_message_ids=execution["output_message_ids"],
+            )
+            return _run_result(run_id, status, execution=execution)
 
         except Exception as err:  # noqa: BLE001 - run 内部任何异常都转成 failed/aborted
             logger.exception("run %s failed", run_id)
@@ -266,16 +390,74 @@ async def _execute_run(
                     error=None,
                     output_message_ids=[],
                 )
-            else:
-                await _finalize(
-                    session,
-                    run_id=run_id,
-                    conversation_id=conversation_id,
-                    agent_id=agent_id,
-                    status="failed",
-                    error=message,
-                    output_message_ids=[],
-                )
+                return _run_result(run_id, "aborted")
+            await _finalize(
+                session,
+                run_id=run_id,
+                conversation_id=conversation_id,
+                agent_id=agent_id,
+                status="failed",
+                error=message,
+                output_message_ids=[],
+            )
+            return _run_result(run_id, "failed", error=message)
+
+
+async def _execute_simple_run(
+    session: AsyncSession,
+    *,
+    run_id: str,
+    signal: AbortSignal,
+    agent: Agent,
+    conv: Conversation | None,
+    workspace: Workspace,
+    trigger: Message,
+    prompt: str,
+    attachments: list[dict[str, Any]] | None,
+    parent_run_id: str | None,
+    override_system_prompt: str | None,
+    override_tool_names: list[str] | None,
+    require_task_report: bool,
+    skip_history: bool,
+) -> dict[str, Any]:
+    """普通 Agent：消费 adapter 事件流；顶层 run 收尾时按写入证据生成 project 产物。"""
+    tool_names = list(override_tool_names or agent.tool_names or [])
+    if require_task_report and REPORT_TASK_RESULT_TOOL_NAME not in tool_names:
+        tool_names.append(REPORT_TASK_RESULT_TOOL_NAME)
+
+    adapter_input = await build_adapter_input(
+        session,
+        agent=agent,
+        conv=conv,
+        workspace=workspace,
+        run_id=run_id,
+        prompt=prompt,
+        tool_names=tool_names,
+        system_prompt_override=override_system_prompt,
+        attachments=attachments,
+        conversation_id=trigger.conversation_id,
+        exclude_message_id=trigger.id,
+        include_history=not skip_history,
+    )
+    adapter = get_adapter(agent.adapter_name)
+    execution = await consume_stream(session, adapter, adapter_input, signal, run_id)
+
+    if parent_run_id is not None:
+        # 子 run 的 project 产物由调度器在任务收尾时统一生成
+        return execution
+
+    try:
+        evidence = get_run_tool_evidence(run_id)
+        project_artifact_id = await maybe_create_project_artifact(
+            evidence_file_writes=evidence.fileWrites,
+            conversation_id=trigger.conversation_id,
+            agent_id=agent.id,
+        )
+        if project_artifact_id:
+            execution["artifact_ids"].append(project_artifact_id)
+    finally:
+        clear_run_tool_evidence(run_id)
+    return execution
 
 
 # ─── Adapter 输入构造 ─────────────────────────────────────
@@ -294,20 +476,37 @@ _GROUP_CHAT_SYSTEM_NOTE = "\n".join(
 )
 
 
-async def _build_adapter_input(
+async def build_adapter_input(
     session: AsyncSession,
     *,
     agent: Agent,
     conv: Conversation | None,
     workspace: Workspace,
-    trigger: Message,
     run_id: str,
+    prompt: str,
+    tool_names: list[str],
+    system_prompt_override: str | None = None,
+    attachments: list[dict[str, Any]] | None = None,
+    conversation_id: str,
+    exclude_message_id: str | None,
+    include_history: bool,
 ) -> AdapterInput:
-    prompt = _extract_text_from_parts(trigger.parts)
+    """拼 AdapterInput：workspace 块 + system prompt + 工具调用规范 + 历史。
 
+    编排的计划/聚合阶段用 system_prompt_override 换掉 persona；子 Agent 用
+    include_history=False 跳过群聊历史（隔离上下文已在 prompt 里）。
+    """
     # system prompt：workspace 信息块在前（让 LLM 明确知道自己在哪个目录干活）
     effective_cwd = get_effective_cwd(workspace)
-    system_prompt = _build_workspace_context_block(workspace, effective_cwd) + "\n\n" + agent.system_prompt
+    base_system_prompt = (
+        system_prompt_override if system_prompt_override is not None else agent.system_prompt
+    )
+    system_prompt = _build_workspace_context_block(workspace, effective_cwd) + "\n\n" + base_system_prompt
+
+    # 按实际工具集补一段调用规范（计划阶段 / 本地项目模式 / 各工具的用法约束）
+    tool_guidance = build_agent_hub_tool_guidance(agent.adapter_name, tool_names, workspace.mode)
+    if tool_guidance:
+        system_prompt += "\n\n" + tool_guidance
 
     # Key 三层解析：agents.api_key > app_settings > 环境变量。
     # 只在 per-agent 字段为空时才注入全局配置，避免覆盖用户的精细配置。
@@ -321,7 +520,7 @@ async def _build_adapter_input(
     # 跨 run 历史注入：只有 custom adapter 消费（ClaudeCode / Codex 走
     # SDK session 续接；mock 忽略）。失败退化到「无历史」，不让 run 崩。
     history: list[dict[str, Any]] = []
-    if agent.adapter_name == "custom":
+    if agent.adapter_name == "custom" and include_history:
         if conv is not None and len(conv.agent_ids or []) > 1:
             system_prompt += "\n\n" + _GROUP_CHAT_SYSTEM_NOTE
         try:
@@ -333,8 +532,8 @@ async def _build_adapter_input(
             history = await build_history_for(
                 session,
                 agent.id,
-                trigger.conversation_id,
-                exclude_message_id=trigger.id,
+                conversation_id,
+                exclude_message_id=exclude_message_id,
                 token_budget=history_budget,
             )
         except Exception:  # noqa: BLE001 - 历史是增强，不是依赖
@@ -342,7 +541,7 @@ async def _build_adapter_input(
 
     return AdapterInput(
         agentId=agent.id,
-        conversationId=trigger.conversation_id,
+        conversationId=conversation_id,
         runId=run_id,
         prompt=prompt,
         workspacePath=effective_cwd,
@@ -350,8 +549,8 @@ async def _build_adapter_input(
         apiKey=api_key,
         apiBaseUrl=agent.api_base_url,
         modelId=agent.model_id,
-        toolNames=list(agent.tool_names or []),
-        attachments=await _collect_attachments(session, trigger, workspace.root_path),
+        toolNames=list(tool_names),
+        attachments=attachments,
         history=history or None,
         customConfig=(
             {
@@ -429,30 +628,58 @@ async def _collect_attachments(
     ]
 
 
-async def _consume_stream(
+def read_artifact_handoff_result(result: Any) -> dict[str, str] | None:
+    """工具结果里的 artifact 交接声明：`{artifactId, outputKey}`（outputKey 去空白后非空）。"""
+    if not isinstance(result, dict):
+        return None
+    artifact_id = result.get("artifactId")
+    output_key = result.get("outputKey")
+    if not isinstance(artifact_id, str) or not isinstance(output_key, str):
+        return None
+    if not output_key.strip():
+        return None
+    return {"artifactId": artifact_id, "outputKey": output_key}
+
+
+async def consume_stream(
     session: AsyncSession,
     adapter: AgentPlatformAdapter,
     adapter_input: AdapterInput,
     signal: AbortSignal,
     run_id: str,
+    on_tool_call: Any = None,
 ) -> dict[str, Any]:
     """消费 adapter 事件：**每条先落库、再广播**。
 
     落库可能派生新事件（artifact.create → 注入 artifact_ref part），派生事件同样按
-    「先落库、再广播」的顺序补发。
+    「先落库、再广播」的顺序补发。额外收集执行结果：产物 id 列表、按 outputKey
+    归位的产物映射、report_task_result 上报的任务报告。
+
+    on_tool_call(event) 可返回 `{"stop": True, "result": ..., "isError": ...}` 提前
+    结束本轮（计划阶段拿到 plan_tasks 就收工）：合成 tool.result / message.end
+    同样先落库再广播，然后中断消费。
     """
     parts_buffer: dict[str, list[Any]] = {}
+    artifact_ids: list[str] = []
     output_message_ids: list[str] = []
+    output_artifacts: dict[str, str] = {}
+    output_key_by_artifact_id: dict[str, str] = {}
+    tool_name_by_call_id: dict[str, str] = {}
+    task_report: Any = None
     current_message_id: str | None = None
 
     async for event in adapter.stream(adapter_input, signal):
         if isinstance(event, MessageStartEvent):
             current_message_id = event.messageId
+        if isinstance(event, ToolCallEvent):
+            tool_name_by_call_id[event.callId] = event.toolName
+
         derived = await _persist_event(
             session,
             event,
             parts_buffer=parts_buffer,
             output_message_ids=output_message_ids,
+            artifact_ids=artifact_ids,
             run_id=run_id,
             agent_id=adapter_input.agentId,
             current_message_id=current_message_id,
@@ -461,7 +688,74 @@ async def _consume_stream(
         for extra in derived:
             event_bus.publish(extra)
 
-    return {"output_message_ids": output_message_ids, "current_message_id": current_message_id}
+        if isinstance(event, ArtifactCreateEvent):
+            output_key = output_key_by_artifact_id.get(event.artifact.id)
+            if output_key:
+                output_artifacts[output_key] = event.artifact.id
+
+        if isinstance(event, MessageEndEvent):
+            current_message_id = None
+
+        if isinstance(event, ToolResultEvent):
+            tool_name = tool_name_by_call_id.get(event.callId)
+            if tool_name and not event.isError and is_task_result_report_tool_name(tool_name):
+                report = read_task_result_report_from_tool_result(event.result)
+                if report:
+                    task_report = report
+            handoff = read_artifact_handoff_result(event.result)
+            if handoff:
+                output_key_by_artifact_id[handoff["artifactId"]] = handoff["outputKey"]
+
+        if isinstance(event, ToolCallEvent) and on_tool_call is not None:
+            control = on_tool_call(event)
+            if isinstance(control, dict) and control.get("stop"):
+                if "result" in control:
+                    result_event = ToolResultEvent(
+                        conversationId=event.conversationId,
+                        timestamp=now_ms(),
+                        messageId=event.messageId,
+                        callId=event.callId,
+                        result=control["result"],
+                        isError=bool(control.get("isError", False)),
+                    )
+                    await _persist_event(
+                        session,
+                        result_event,
+                        parts_buffer=parts_buffer,
+                        output_message_ids=output_message_ids,
+                        artifact_ids=artifact_ids,
+                        run_id=run_id,
+                        agent_id=adapter_input.agentId,
+                        current_message_id=current_message_id,
+                    )
+                    event_bus.publish(result_event)
+
+                end_event = MessageEndEvent(
+                    conversationId=event.conversationId,
+                    timestamp=now_ms(),
+                    messageId=event.messageId,
+                )
+                await _persist_event(
+                    session,
+                    end_event,
+                    parts_buffer=parts_buffer,
+                    output_message_ids=output_message_ids,
+                    artifact_ids=artifact_ids,
+                    run_id=run_id,
+                    agent_id=adapter_input.agentId,
+                    current_message_id=current_message_id,
+                )
+                event_bus.publish(end_event)
+                current_message_id = None
+                break
+
+    return {
+        "artifact_ids": artifact_ids,
+        "output_message_ids": output_message_ids,
+        "output_artifacts": output_artifacts,
+        "task_report": task_report,
+        "current_message_id": current_message_id,
+    }
 
 
 async def _persist_event(
@@ -470,6 +764,7 @@ async def _persist_event(
     *,
     parts_buffer: dict[str, list[Any]],
     output_message_ids: list[str],
+    artifact_ids: list[str],
     run_id: str,
     agent_id: str,
     current_message_id: str | None = None,
@@ -552,6 +847,7 @@ async def _persist_event(
         await _write_parts(session, event.messageId, parts)
 
     elif isinstance(event, ArtifactCreateEvent):
+        artifact_ids.append(event.artifact.id)
         # 工具产出的产物除了 tool_result，还要在消息里挂一个 artifact_ref part，
         # 否则聊天流里只有一行工具日志、看不到产物卡片
         if current_message_id is not None:

@@ -25,6 +25,7 @@ from app.api import (
     message_ops,
     messages,
     pending_bash_commands,
+    pending_dispatch_plans,
     pending_questions,
     pending_writes,
     platform,
@@ -82,6 +83,7 @@ app.include_router(deployments.router)
 app.include_router(message_ops.router)
 app.include_router(messages.router)
 app.include_router(pending_bash_commands.router)
+app.include_router(pending_dispatch_plans.router)
 app.include_router(pending_questions.router)
 app.include_router(pending_writes.router)
 app.include_router(platform.router)
