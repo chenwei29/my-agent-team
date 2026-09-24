@@ -12,6 +12,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.builtin_agents import builtin_agents
+from app.db.message_search import install_message_search
 from app.db.models import Agent, Base
 from app.db.session import SessionLocal, engine
 
@@ -19,6 +20,8 @@ from app.db.session import SessionLocal, engine
 async def ensure_schema() -> None:
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        # 全文索引是虚表 + 触发器，create_all 不管，得单独幂等安装
+        await conn.run_sync(install_message_search)
 
 
 async def ensure_builtin_agents(session: AsyncSession) -> int:

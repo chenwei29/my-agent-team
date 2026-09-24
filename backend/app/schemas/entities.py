@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from typing import Annotated, Any, Literal
 
-from pydantic import ConfigDict, Field, model_validator
+from pydantic import ConfigDict, Field, field_validator, model_validator
 from pydantic.alias_generators import to_camel
 
 from app.schemas.base import CamelModel
@@ -103,6 +103,105 @@ class AppSettingsOut(CamelModel):
     updated_at: int
 
 
+class ContextSummaryOut(CamelModel):
+    id: str
+    conversation_id: str
+    summary: str
+    covered_until_message_id: str
+    covered_until_created_at: int
+    source_message_count: int
+    token_estimate: int
+    model_provider: str | None = None
+    model_id: str | None = None
+    created_at: int
+
+
+class CompactConversationResponse(CamelModel):
+    summary: ContextSummaryOut
+    message: MessageOut
+
+
+class UsageBucketOut(CamelModel):
+    input_tokens: int
+    output_tokens: int
+    cache_read_tokens: int
+    cache_creation_tokens: int
+    total_tokens: int
+    runs: int
+
+
+class UsageTopConversationOut(CamelModel):
+    id: str
+    title: str
+    total_tokens: int
+    runs: int
+    updated_at: int
+
+
+class UsageByAgentOut(CamelModel):
+    agent_id: str
+    name: str
+    total_tokens: int
+    runs: int
+
+
+class UsageByModelOut(CamelModel):
+    model: str
+    total_tokens: int
+    runs: int
+
+
+class UsageSummaryOut(CamelModel):
+    today: UsageBucketOut
+    week: UsageBucketOut
+    all_time: UsageBucketOut
+    top_conversations: list[UsageTopConversationOut]
+    by_agent: list[UsageByAgentOut]
+    by_model: list[UsageByModelOut]
+
+
+# ─── Agent 草稿（对话式创建 Agent 的中间产物）────────────────
+class AgentDraftAssumptionOut(CamelModel):
+    label: Annotated[str, Field(min_length=1, max_length=40)]
+    detail: Annotated[str, Field(min_length=1, max_length=240)]
+
+
+class AgentToolPermissionSummaryOut(CamelModel):
+    tool_name: Annotated[str, Field(min_length=1)]
+    label: Annotated[str, Field(min_length=1, max_length=40)]
+    desc: Annotated[str, Field(min_length=1, max_length=200)]
+
+
+class AgentConfigDraftOut(CamelModel):
+    """草稿形状与保存接口同源：custom 草稿必须带 provider+model，SDK 草稿不带 toolNames。"""
+
+    name: Annotated[str, Field(min_length=1, max_length=64)]
+    avatar: Annotated[str, Field(max_length=8)] = "🤖"
+    description: Annotated[str, Field(min_length=1, max_length=280)]
+    capabilities: list[str] = Field(default_factory=list)
+    system_prompt: Annotated[str, Field(min_length=1)]
+    adapter_name: AdapterName = "custom"
+    model_provider: ModelProvider | None = None
+    model_id: Annotated[str, Field(min_length=1)] | None = None
+    tool_names: list[str] = Field(default_factory=list)
+    supports_vision: bool = True
+    rationale: list[str] = Field(default_factory=list)
+    assumptions: list[AgentDraftAssumptionOut] = Field(default_factory=list)
+    tool_permission_summaries: list[AgentToolPermissionSummaryOut] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _cross_field(self) -> AgentConfigDraftOut:
+        if self.adapter_name == "custom" and (not self.model_provider or not self.model_id):
+            raise ValueError("Custom draft requires modelProvider and modelId")
+        if self.adapter_name != "custom" and self.tool_names:
+            raise ValueError("SDK adapter draft must not include custom toolNames")
+        return self
+
+
+class AgentDraftResponse(CamelModel):
+    draft: AgentConfigDraftOut
+
+
 # ─── 响应信封（前端读的是 { agents: [...] } / { conversation: {...} } 这类包一层）──
 class AgentsResponse(CamelModel):
     agents: list[AgentOut]
@@ -170,6 +269,18 @@ class ListDirResponse(CamelModel):
 # ─── 请求体：Agents ─────────────────────────────────────────
 # 前端一律发 camelCase，所以请求体也用 CamelModel 的 alias 机制（populate_by_name 让 Python
 # 侧仍可用 snake_case 构造），否则 systemPrompt / modelProvider 这类字段根本收不到。
+class AgentDraftBody(CamelModel):
+    """草稿生成请求：intent 先 trim 再卡长度（与「trim 后 6-4000」的口径一致）。"""
+
+    intent: Annotated[str, Field(min_length=6, max_length=4000)]
+    follow_up: Annotated[str, Field(max_length=2000)] | None = None
+
+    @field_validator("intent", "follow_up", mode="before")
+    @classmethod
+    def _strip_input(cls, value: Any) -> Any:
+        return value.strip() if isinstance(value, str) else value
+
+
 class CreateAgentBody(CamelModel):
     name: Annotated[str, Field(min_length=1, max_length=64)]
     avatar: Annotated[str, Field(max_length=8)] = ""

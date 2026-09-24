@@ -157,6 +157,7 @@ async def test_delete_unknown_agent_is_400_not_404(client: AsyncClient):
     assert res.status_code == 400
 
 
-async def test_agent_draft_is_not_implemented_yet(client: AsyncClient):
+async def test_agent_draft_requires_intent(client: AsyncClient):
+    """草稿生成收下 intent 才能干活；空请求体按 Invalid body 拒绝（行为测试见 test_agent_draft.py）。"""
     res = await client.post("/api/agents/draft", json={})
-    assert res.status_code == 501
+    assert res.status_code == 400

@@ -13,6 +13,7 @@ from app.db.session import get_session
 from app.errors import HttpError, ServiceError
 from app.schemas.base import validate_body
 from app.schemas.entities import (
+    CompactConversationResponse,
     ConversationResponse,
     ConversationsResponse,
     CreateConversationBody,
@@ -20,6 +21,7 @@ from app.schemas.entities import (
     PatchConversationBody,
 )
 from app.services import conversation_service, deploy_command_service
+from app.services.context_compaction import compact_conversation
 
 router = APIRouter(prefix="/api/conversations", tags=["conversations"])
 
@@ -100,6 +102,17 @@ async def deploy_conversation(
         return await deploy_command_service.handle_deploy_command(
             session, conversation_id, parsed.artifact_id
         )
+    except ServiceError as err:
+        raise HttpError(400, err.message) from err
+
+
+@router.post("/{conversation_id}/compact", response_model=CompactConversationResponse)
+async def compact(
+    conversation_id: str, session: AsyncSession = Depends(get_session)
+) -> dict:
+    """压缩较早的会话历史为摘要（错误一律 400，body 形状 { error: message }）。"""
+    try:
+        return await compact_conversation(session, conversation_id)
     except ServiceError as err:
         raise HttpError(400, err.message) from err
 

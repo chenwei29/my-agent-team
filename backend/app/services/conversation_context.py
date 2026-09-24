@@ -9,8 +9,9 @@
 - pinned 消息无视截断永远注入（用户的 pin 是显式契约），且不被 token 预算丢弃；
 - 超预算时从老到新丢非 pinned 项。
 
-上下文摘要：摘要的**生成**在后续阶段接入；读取最新摘要与渲染摘要块的辅助
-函数在本模块（子 Agent 上下文与 prompt 前缀会用到），summary 为空即无操作。
+上下文摘要：有最新摘要时，历史注入变成「摘要块（视同 pinned，永丢不掉）+ 覆盖点
+之后的消息」，被摘要覆盖的旧消息不再进来。摘要的生成在 context_compaction 模块，
+读取最新摘要与渲染摘要块的辅助函数在本模块（子 Agent 上下文与 prompt 前缀会用到）。
 """
 
 from __future__ import annotations
@@ -38,6 +39,7 @@ async def build_history_for(
 ) -> list[dict[str, Any]]:
     """DB 读 + 纯转换。失败由调用方捕获并退化到「无历史」，不影响主流程。"""
     conv = await session.scalar(select(Conversation).where(Conversation.id == conversation_id))
+    latest_summary = await get_latest_context_summary(session, conversation_id)
 
     # 最近 N 条 complete 消息（触发消息本身排除，避免重复）
     conditions = [
@@ -46,6 +48,9 @@ async def build_history_for(
     ]
     if exclude_message_id:
         conditions.append(Message.id != exclude_message_id)
+    if latest_summary is not None:
+        # 已被摘要覆盖的旧消息不再进历史
+        conditions.append(Message.created_at > latest_summary.covered_until_created_at)
     recent_stmt = (
         select(Message)
         .where(*conditions)
@@ -91,6 +96,19 @@ async def build_history_for(
 
     # 先序列化全量，再按 token 预算从老往新丢非 pinned 项
     items: list[dict[str, Any]] = []
+    if latest_summary is not None:
+        # 摘要块排最前、视同 pinned —— 它是被压缩历史的唯一代表，预算再紧也不能丢
+        summary_message = {
+            "role": "user",
+            "content": render_conversation_summary_block(latest_summary),
+        }
+        items.append(
+            {
+                "is_pinned": True,
+                "serialized": [summary_message],
+                "tokens": _estimate_chat_message_tokens(summary_message),
+            }
+        )
     for msg in merged:
         serialized = _serialize_message(msg, agent_id, artifact_titles, agent_names)
         if not serialized:

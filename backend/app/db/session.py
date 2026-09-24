@@ -9,6 +9,7 @@ WAL + busy_timeout：P2 起多个 run 任务会并发写同一个库文件（每
 
 from __future__ import annotations
 
+import json
 from collections.abc import AsyncIterator
 
 from sqlalchemy import event
@@ -18,7 +19,14 @@ from app.config import get_settings
 
 _settings = get_settings()
 
-engine = create_async_engine(_settings.database_url, future=True)
+# JSON 列按「字面 Unicode」落盘（中文不写成 \uXXXX 转义）——搜索的 LIKE 降级路径
+# 要在 messages.parts 的原始 JSON 文本上做子串匹配，转义存储会让中文查询打不中。
+# 读回不受影响（两种编码都能 loads）。
+engine = create_async_engine(
+    _settings.database_url,
+    future=True,
+    json_serializer=lambda v: json.dumps(v, ensure_ascii=False),
+)
 
 # 并发 run 抢写时等锁的上限（毫秒）；超过就报错，而不是立刻 database is locked
 BUSY_TIMEOUT_MS = 5000

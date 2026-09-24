@@ -49,6 +49,7 @@ from app.schemas.events import (
 )
 from app.security.workspace_utils import get_effective_cwd
 from app.services import settings_service
+from app.services.context_compaction import prefix_prompt_with_context_summary
 from app.services.conversation_context import build_history_for
 from app.services.dispatch_prompts import build_agent_hub_tool_guidance
 from app.services.dispatch_run_evidence import clear_run_tool_evidence, get_run_tool_evidence
@@ -424,6 +425,19 @@ async def _execute_simple_run(
     tool_names = list(override_tool_names or agent.tool_names or [])
     if require_task_report and REPORT_TASK_RESULT_TOOL_NAME not in tool_names:
         tool_names.append(REPORT_TASK_RESULT_TOOL_NAME)
+
+    # SDK 类 adapter 不消费 history 数组，上下文摘要改以 prompt 前缀注入
+    # （custom adapter 走 build_history_for 的「摘要 + 摘要之后的消息」）。
+    # override prompt（编排隔离上下文）不加前缀；失败退化到无前缀，不让 run 崩。
+    if agent.adapter_name in ("claude-code", "codex") and not skip_history:
+        try:
+            prompt = await prefix_prompt_with_context_summary(
+                session, trigger.conversation_id, prompt
+            )
+        except Exception:  # noqa: BLE001 - 摘要前缀是增强，不是依赖
+            logger.exception(
+                "prefix_prompt_with_context_summary failed; continuing without summary"
+            )
 
     adapter_input = await build_adapter_input(
         session,

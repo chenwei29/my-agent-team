@@ -6,7 +6,7 @@ E2E 专用 mock agent 只能由 bootstrap_cli 直接写库 —— 请求体校�
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, Request, Response
+from fastapi import APIRouter, Depends, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.helpers import read_json
@@ -14,12 +14,15 @@ from app.db.session import get_session
 from app.errors import HttpError, ServiceError
 from app.schemas.base import validate_body
 from app.schemas.entities import (
+    AgentDraftBody,
+    AgentDraftResponse,
     AgentResponse,
     AgentsResponse,
     CreateAgentBody,
     UpdateAgentBody,
 )
 from app.services import agent_service
+from app.services.agent_draft import create_agent_config_draft
 
 router = APIRouter(prefix="/api/agents", tags=["agents"])
 
@@ -32,14 +35,14 @@ async def list_agents(session: AsyncSession = Depends(get_session)) -> dict:
     return {"agents": await agent_service.list_agents_ordered(session)}
 
 
-@router.post("/draft", status_code=501)
-async def create_agent_draft() -> Response:
-    """P1 先占位：agent 草稿生成要真调 LLM，属 P3。"""
-    return Response(
-        content='{"error":"Agent draft generation is not implemented yet (phase 3)"}',
-        media_type="application/json",
-        status_code=501,
-    )
+@router.post("/draft", response_model=AgentDraftResponse)
+async def create_agent_draft(request: Request) -> dict:
+    """从一句描述生成 Agent 配置草稿（启发式规则，不调 LLM）。"""
+    body = validate_body(AgentDraftBody, await read_json(request))
+    try:
+        return {"draft": create_agent_config_draft(body.intent, body.follow_up)}
+    except (ServiceError, ValueError) as err:
+        raise HttpError(_BAD_REQUEST, str(err)) from err
 
 
 @router.post("", status_code=201, response_model=AgentResponse)

@@ -106,3 +106,9 @@ async def get_effective_api_key(session: AsyncSession, provider: str) -> str | N
     }
     stored = settings.get(field_by_provider[provider])
     return stored or os.environ.get(env_by_provider[provider]) or None
+
+
+async def get_effective_anthropic_base_url(session: AsyncSession) -> str | None:
+    """app_settings → env var → None（None 表示用官方默认端点）。"""
+    settings = await get_app_settings(session)
+    return settings.get("anthropic_base_url") or os.environ.get("ANTHROPIC_BASE_URL") or None

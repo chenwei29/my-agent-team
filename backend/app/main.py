@@ -30,8 +30,10 @@ from app.api import (
     pending_writes,
     platform,
     runs,
+    search,
     settings,
     stream,
+    usage,
 )
 from app.config import get_settings
 from app.db.bootstrap import bootstrap_database
@@ -88,9 +90,11 @@ app.include_router(pending_questions.router)
 app.include_router(pending_writes.router)
 app.include_router(platform.router)
 app.include_router(fs.router)
+app.include_router(search.router)
 app.include_router(settings.router)
 app.include_router(stream.router)
 app.include_router(runs.router)
+app.include_router(usage.router)
 
 
 # ─── 错误响应 ────────────────────────────────────────────────
